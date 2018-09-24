@@ -3,6 +3,35 @@
 void util_init();
 void util_reset();
 
+struct TD_CAM_INFO {
+	float mX, mY, mZ;
+	float mRotX, mRotY, mRotZ;
+	float mPivotX, mPivotY, mPivotZ;
+	float mXOrd;
+	float mROrd;
+	float mFOVType;
+	float mFOV;
+	float mFocal;
+	float mAperture;
+	float mNear;
+	float mFar;
+
+	exTransformOrd xord() const {
+		int i = (int)mXOrd;
+		if (i >= 0 && i <= 5) return (exTransformOrd)i;
+		return exTransformOrd::SRT;
+	}
+
+	exRotOrd rord() const {
+		int i = (int)mROrd;
+		if (i >= 0 && i <= 5) return (exRotOrd)i;
+		return exRotOrd::XYZ;
+	}
+
+	cxMtx calc_xform() const;
+	void calc_pos_tgt(cxVec* pPos, cxVec* pTgt, float dist = 0.0f) const;
+};
+
 struct CAM_INFO {
 	cxVec mPos;
 	cxQuat mQuat;
@@ -51,6 +80,17 @@ struct TEXTURE_LIB {
 	int get_tex_num() const { return mpCat ? mpCat->mFilesNum : 0; }
 };
 
+struct TEXDATA_LIB {
+	sxFileCatalogue* mpCat;
+	sxTextureData** mppTexs;
+
+	TEXDATA_LIB() : mpCat(nullptr), mppTexs(nullptr) {}
+
+	void init(const char* pBasePath);
+	void reset();
+	int get_tex_num() const { return mpCat ? mpCat->mFilesNum : 0; }
+};
+
 struct TRACKBALL {
 	cxQuat mSpin;
 	cxQuat mQuat;
@@ -82,6 +122,7 @@ struct SH_COEFS {
 
 	void clear();
 	void from_geo(sxGeometryData& geo, float scl = 1.0f);
+	void from_pano(const cxColor* pClr, int w, int h);
 
 	float* get_channel(int i) {
 		float* pData = nullptr;
@@ -93,17 +134,53 @@ struct SH_COEFS {
 		return pData;
 	}
 
+	cxColor get_ambient() const {
+		return cxColor(mR[0], mG[0], mB[0]);
+	}
+
+	cxVec calc_dominant_dir() const {
+		int idx = nxSH::calc_ary_idx(1, 1);
+		float lx = cxColor(mR[idx], mG[idx], mB[idx]).luminance();
+		idx = nxSH::calc_ary_idx(1, -1);
+		float ly = cxColor(mR[idx], mG[idx], mB[idx]).luminance();
+		idx = nxSH::calc_ary_idx(1, 0);
+		float lz = cxColor(mR[idx], mG[idx], mB[idx]).luminance();
+		return cxVec(-lx, -ly, lz).get_normalized();
+	}
+
+	cxColor calc_color(const cxVec dir) const;
+
 	void calc_diff_wgt(float s, float scl) { nxSH::calc_weights(mWgtDiff, ORDER, s, scl); }
 	void calc_refl_wgt(float s, float scl) { nxSH::calc_weights(mWgtRefl, ORDER, s, scl); }
 
 	void scl(const cxColor& clr);
 };
 
+struct ENV_LIGHT {
+	SH_COEFS mSH;
+	const sxTextureData* mpTex;
+	cxVec mDominantDir;
+	cxColor mDominantClr;
+	float mDominantLum;
+	cxColor mAmbientClr;
+	float mAmbientLum;
+
+	ENV_LIGHT() : mpTex(nullptr) {}
+
+	void init(const sxTextureData* pTex);
+	void apply(GEX_LIT* pLit, float diffRate = 0.0f, float specRate = 0.75f);
+};
+
 TRACKBALL* get_trackball();
 float get_wheel_val();
 
-int64_t get_timestamp();
 int get_test_mode();
+int get_max_workers();
+void con_locate(int x, int y);
+void con_text_color(const cxColor& clr = cxColor(0.5f));
+
+struct TSK_BRIGADE;
+TSK_BRIGADE* get_brigade();
 
 template<typename T> inline T approach(const T& val, const T& dst, int time) {
 	float flen = (float)(time < 1 ? 1 : time);
@@ -122,12 +199,19 @@ GEX_LIT* make_lights(const sxValuesData& vals, cxVec* pDominantDir = nullptr);
 GEX_LIT* make_const_lit(const char* pName = nullptr, float val = 1.0f);
 void init_materials(GEX_OBJ& obj, const sxValuesData& vals, bool useReflectColor = false);
 CAM_INFO get_cam_info(const sxValuesData& vals, const char* pCamName);
+TD_CAM_INFO parse_td_cam(const char* pData, size_t dataSize);
+TD_CAM_INFO load_td_cam(const char* pPath);
 void obj_shadow_mode(const GEX_OBJ& obj, bool castShadows, bool receiveShadows);
 void obj_shadow_params(const GEX_OBJ& obj, float density, float selfShadowFactor, bool cullShadows);
 void obj_tesselation(const GEX_OBJ& obj, GEX_TESS_MODE mode, float factor);
+void obj_diff_roughness(const GEX_OBJ& obj, const cxColor& rgb);
 void obj_diff_mode(const GEX_OBJ& obj, GEX_DIFF_MODE mode);
+void obj_spec_mode(const GEX_OBJ& obj, GEX_SPEC_MODE mode);
 void obj_sort_mode(const GEX_OBJ& obj, GEX_SORT_MODE mode);
 void obj_sort_bias(const GEX_OBJ& obj, float absBias, float relBias);
 void mtl_sort_mode(const GEX_OBJ& obj, const char* pMtlName, GEX_SORT_MODE mode);
 void mtl_sort_bias(const GEX_OBJ& obj, const char* pMtlName, float absBias, float relBias);
+void mtl_sh_diff_detail(const GEX_OBJ& obj, const char* pMtlName, float dtl);
+void mtl_sh_refl_detail(const GEX_OBJ& obj, const char* pMtlName, float dtl);
 
+void dump_riglink_info(sxKeyframesData* pKfr, sxKeyframesData::RigLink* pLink, FILE* pOut = nullptr);

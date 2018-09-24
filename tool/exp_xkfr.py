@@ -27,7 +27,8 @@ import xh
 
 
 class NodeInfo:
-	def __init__(self, node, nodePathId, nodeNameId, nodeTypeId):
+	def __init__(self, xkfr, node, nodePathId, nodeNameId, nodeTypeId):
+		self.xkfr = xkfr
 		self.pathId = nodePathId
 		self.nameId = nodeNameId
 		self.typeId = nodeTypeId
@@ -38,9 +39,9 @@ class NodeInfo:
 		self.xord = xd.xformOrdFromStr(self.xordStr)
 
 	def write(self, bw):
-		bw.writeI16(self.pathId) # +00
-		bw.writeI16(self.nameId) # +02
-		bw.writeI16(self.typeId) # +04
+		self.xkfr.writeStrId16(bw, self.pathId) # +00
+		self.xkfr.writeStrId16(bw, self.nameId) # +02
+		self.xkfr.writeStrId16(bw, self.typeId) # +04
 		bw.writeU8(self.rord) # +06
 		bw.writeU8(self.xord) # +07
 
@@ -77,7 +78,7 @@ class KfrExporter(xd.BaseExporter):
 				if not nodePath in nodeMap:
 					nodeId = len(self.nodeInfoLst)
 					typeId = self.strLst.add(node.type().name())
-					info = NodeInfo(node, fcv.nodePathId, fcv.nodeNameId, typeId)
+					info = NodeInfo(self, node, fcv.nodePathId, fcv.nodeNameId, typeId)
 					nodeMap[nodePath] = nodeId
 					self.nodeInfoLst.append(info)
 
@@ -140,7 +141,40 @@ class KfrExporter(xd.BaseExporter):
 				if not nodePath in nodeMap:
 					nodeId = len(self.nodeInfoLst)
 					typeId = self.strLst.add("null")
-					info = NodeInfo(hou.node(nodePath), fcv.nodePathId, fcv.nodeNameId, typeId)
+					info = NodeInfo(self, hou.node(nodePath), fcv.nodePathId, fcv.nodeNameId, typeId)
+					nodeMap[nodePath] = nodeId
+					self.nodeInfoLst.append(info)
+
+	def buildFromCHOP(self, path, nodeInfoFlg = True):
+		chop = hou.node(path)
+		self.fps = chop.sampleRate()
+		fcvLst = []
+		for trk in chop.tracks():
+			fcv = xh.fcvFromCHOPTrack(trk)
+			fcvLst.append(fcv)
+		self.fcv = []
+		for fcv in fcvLst:
+			if fcv.isAnimated():
+				fcv.nodePathId = self.strLst.add(fcv.nodePath)
+				fcv.nodeNameId = self.strLst.add(fcv.nodeName)
+				fcv.chNameId = self.strLst.add(fcv.chName)
+				self.fcv.append(fcv)
+		self.minFrame = 0
+		self.maxFrame = -1
+		for fcv in self.fcv:
+			self.maxFrame = max(self.maxFrame, fcv.maxFrame)
+		self.nodeInfoLst = []
+		if nodeInfoFlg:
+			nodeMap = {}
+			for fcv in self.fcv:
+				if fcv.nodePath != None and len(fcv.nodePath) > 0:
+					nodePath = fcv.nodePath + "/" + fcv.nodeName
+				else:
+					nodePath = fcv.nodeName
+				if not nodePath in nodeMap:
+					nodeId = len(self.nodeInfoLst)
+					typeId = self.strLst.add("null")
+					info = NodeInfo(self, None, fcv.nodePathId, fcv.nodeNameId, typeId)
 					nodeMap[nodePath] = nodeId
 					self.nodeInfoLst.append(info)
 
@@ -162,9 +196,9 @@ class KfrExporter(xd.BaseExporter):
 		bw.patch(self.patchPos, bw.getPos() - top)
 		lstPatchTop = bw.getPos()
 		for fcv in self.fcv:
-			bw.writeI16(fcv.nodePathId) # +00
-			bw.writeI16(fcv.nodeNameId) # +02
-			bw.writeI16(fcv.chNameId) # +04
+			self.writeStrId16(bw, fcv.nodePathId) # +00
+			self.writeStrId16(bw, fcv.nodeNameId) # +02
+			self.writeStrId16(bw, fcv.chNameId) # +04
 			bw.writeU16(fcv.getKeyNum()) # +06
 			bw.writeF32(fcv.minVal) # +08
 			bw.writeF32(fcv.maxVal) # +0C
@@ -225,7 +259,7 @@ def testClip(outPath):
 
 if __name__=="__main__":
 	outPath = hou.expandString("$HIP/")
-	outPath = exePath
+	#outPath = exePath
 	#outPath = r"D:/tmp/"
 	outPath += "/_test.xkfr"
 

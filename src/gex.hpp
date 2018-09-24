@@ -92,6 +92,11 @@ enum class GEX_SHADOW_PROJ {
 	PERSPECTIVE = 1
 };
 
+enum class GEX_BG_MODE {
+	NONE = 0,
+	PANO = 1
+};
+
 struct GEX_CAM;
 struct GEX_LIT;
 struct GEX_OBJ;
@@ -109,8 +114,12 @@ int gexGetDispFreq();
 void gexClearTarget(const cxColor& clr = cxColor(0.0f));
 void gexClearDepth();
 void gexDiffLightFactor(const cxColor& clr);
+void gexDiffSHFactor(const cxColor& clr);
+void gexReflSHFactor(const cxColor& clr);
 void gexGamma(float y);
 void gexGammaRGBA(float yr, float yg, float yb, float ya);
+void gexExposure(float e);
+void gexExposureRGB(float er, float eg, float eb);
 void gexLinearWhite(float w);
 void gexLinearWhiteRGB(float wr, float wg, float wb);
 void gexLinearGain(float gain);
@@ -118,6 +127,9 @@ void gexLinearGainRGB(float r, float g, float b);
 void gexLinearBias(float bias);
 void gexLinearBiasRGB(float r, float g, float b);
 void gexUpdateGlobals();
+
+void gexBgMode(GEX_BG_MODE mode);
+void gexBgPanoramaTex(GEX_TEX* pTex);
 
 float gexCalcFOVY(float focal, float aperture);
 void gexMtxMul(cxMtx* pDst, const cxMtx* pSrcA, const cxMtx* pSrcB);
@@ -131,6 +143,8 @@ void gexShadowDensity(float dens);
 void gexShadowViewSize(float vsize);
 void gexShadowColor(const cxColor& clr);
 void gexShadowProjection(GEX_SHADOW_PROJ prj);
+void gexShadowFade(float start, float end);
+void gexShadowSpecCtrl(int lightIdx, float valSelector = 0.0f);
 
 GEX_CAM* gexCamCreate(const char* pName = nullptr);
 void gexCamDestroy(GEX_CAM* pCam);
@@ -150,21 +164,23 @@ bool gexCkLightIdx(int idx);
 void gexLightMode(GEX_LIT* pLit, int idx, GEX_LIGHT_MODE mode);
 void gexLightPos(GEX_LIT* pLit, int idx, const cxVec& pos);
 void gexLightDir(GEX_LIT* pLit, int idx, const cxVec& dir);
+void gexLightDirDegrees(GEX_LIT* pLit, int idx, float dx, float dy);
 void gexLightColor(GEX_LIT* pLit, int idx, const cxColor& clr, float diff = 1.0f, float spec = 1.0f);
 void gexLightRange(GEX_LIT* pLit, int idx, float attnStart, float rangeEnd);
 void gexLightCone(GEX_LIT* pLit, int idx, float angle, float range);
 void gexFog(GEX_LIT* pLit, const cxColor& clr, float start, float end, float curveP1 = 1.0f/3, float curveP2 = 2.0f/3);
-void gexSHL(GEX_LIT* pLit, GEX_SHL_MODE mode, int order, float* pR, float* pG, float* pB, float* pWgtDiff, float* pWgtRefl);
+void gexSHLW(GEX_LIT* pLit, GEX_SHL_MODE mode, int order, float* pR, float* pG, float* pB, float* pWgtDiff, float* pWgtRefl);
+void gexSHL(GEX_LIT* pLit, GEX_SHL_MODE mode, int order, float* pR, float* pG, float* pB);
 const char* gexLitName(const GEX_LIT* pLit);
 GEX_LIT* gexLitFind(const char* pName);
 
-GEX_TEX* gexTexCreate(const sxTextureData& tex);
+GEX_TEX* gexTexCreate(const sxTextureData& tex, bool compact = true);
 GEX_TEX* gexTexCreateConst(const cxColor& clr, const char* pName);
 void gexTexDestroy(GEX_TEX* pTex);
 const char* gexTexName(const GEX_TEX* pTex);
 GEX_TEX* gexTexFind(const char* pName, const char* pPath = nullptr);
 
-GEX_OBJ* gexObjCreate(const sxGeometryData& geo, const char* pBatGrpPrefix = nullptr);
+GEX_OBJ* gexObjCreate(const sxGeometryData& geo, const char* pBatGrpPrefix = nullptr, const char* pSortMtlsAttr = nullptr);
 void gexObjDestroy(GEX_OBJ* pObj);
 void gexObjSkinInit(GEX_OBJ* pObj, const cxMtx* pRestIW);
 void gexObjTransform(GEX_OBJ* pObj, const cxMtx* pMtx);
@@ -209,8 +225,18 @@ void gexMtlTangentOptions(GEX_MTL* pMtl, bool flipTangent, bool flipBitangent);
 void gexMtlTesselationMode(GEX_MTL* pMtl, GEX_TESS_MODE mode);
 void gexMtlTesselationFactor(GEX_MTL* pMtl, float factor);
 void gexMtlAlpha(GEX_MTL* pMtl, bool enable);
+void gexMtlAlphaBlend(GEX_MTL* pMtl, bool enable);
+void gexMtlAlphaToCoverage(GEX_MTL* pMtl, bool enable);
 void gexMtlRoughness(GEX_MTL* pMtl, float rough);
+void gexMtlDiffuseRoughness(GEX_MTL* pMtl, const cxColor& rgb);
+void gexMtlDiffuseRoughnessTexRate(GEX_MTL* pMtl, float rate);
+void gexMtlSpecularRoughness(GEX_MTL* pMtl, const cxColor& rgb);
+void gexMtlSpecularRoughnessTexRate(GEX_MTL* pMtl, float rate);
+void gexMtlSpecularRoughnessMin(GEX_MTL* pMtl, float min);
 void gexMtlIOR(GEX_MTL* pMtl, const cxVec& ior);
+void gexMtlViewFresnel(GEX_MTL* pMtl, float gain, float bias);
+void gexMtlReflFresnel(GEX_MTL* pMtl, float gain, float bias);
+void gexMtlReflDownFadeRate(GEX_MTL* pMtl, float rate);
 void gexMtlDiffMode(GEX_MTL* pMtl, GEX_DIFF_MODE mode);
 void gexMtlSpecMode(GEX_MTL* pMtl, GEX_SPEC_MODE mode);
 void gexMtlBumpMode(GEX_MTL* pMtl, GEX_BUMP_MODE mode);
@@ -228,3 +254,4 @@ void gexMtlSHDiffuseColor(GEX_MTL* pMtl, const cxColor& clr);
 void gexMtlSHDiffuseDetail(GEX_MTL* pMtl, float dtl);
 void gexMtlSHReflectionColor(GEX_MTL* pMtl, const cxColor& clr);
 void gexMtlSHReflectionDetail(GEX_MTL* pMtl, float dtl);
+void gexMtlSHReflectionFresnelRate(GEX_MTL* pMtl, float rate);

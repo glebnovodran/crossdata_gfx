@@ -47,8 +47,11 @@ struct SDW_CTX {
 	xt_mtx xform;
 	xt_float4 color;
 	xt_float3 dir;
+	xt_float2 fade; // start, invRange
 	xt_float size;
 	xt_float invSize;
+	xt_float specValSel; // 0:sval, 1:val
+	xt_int litIdx;
 };
 
 struct FOG_CTX {
@@ -64,11 +67,14 @@ struct MTL_CTX {
 	xt_float3 baseColor;
 	xt_float3 specColor;
 	xt_float3 diffRoughness;
+	xt_float diffRoughnessTexRate;
 	xt_float diffWrapGain;
 	xt_float diffWrapBias;
 	xt_float diffExpGain;
 	xt_float diffExpBias;
 	xt_float3 specRoughness;
+	xt_float specRoughnessTexRate;
+	xt_float specRoughnessMin;
 	xt_float3 IOR;
 	xt_float3 reflColor;
 	xt_float reflLvl;
@@ -76,6 +82,12 @@ struct MTL_CTX {
 	xt_float shDiffDtl;
 	xt_float3 shReflClr;
 	xt_float shReflDtl;
+	xt_float shReflFrRate;
+	xt_float reflDownFadeRate;
+	xt_float reflFrGain;
+	xt_float reflFrBias;
+	xt_float viewFrGain;
+	xt_float viewFrBias;
 	xt_int diffMode;
 	xt_int specMode;
 	xt_int bumpMode;
@@ -97,8 +109,11 @@ struct MTL_CTX {
 
 struct GLB_CTX {
 	xt_float4 invGamma;
+	xt_float3 exposure;
 	xt_float3 linWhite;
 	xt_float3 linGain;
 	xt_float3 linBias;
 	xt_float3 diffLightFactor;
+	xt_float3 diffSHFactor;
+	xt_float3 reflSHFactor;
 };

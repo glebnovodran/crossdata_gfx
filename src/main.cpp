@@ -10,6 +10,7 @@
 #include "gex.hpp"
 
 #include "util.hpp"
+#include "task.hpp"
 #include "test.hpp"
 
 #define TEST_IFC(_tname) static TEST_IFC ifc_##_tname = {_tname##_init, _tname##_loop, _tname##_end }
@@ -29,17 +30,10 @@ static void tst_dbg_msg(const char* pMsg) {
 	::OutputDebugStringA(pMsg);
 }
 
-void cpu_serialize() {
-	int dummy[4];
-	__cpuid(dummy, 0);
-}
-
-int64_t get_timestamp() {
-	LARGE_INTEGER ctr;
-	cpu_serialize();
-	::QueryPerformanceCounter(&ctr);
-	cpu_serialize();
-	return ctr.QuadPart;
+int get_cpu_count() {
+	SYSTEM_INFO info;
+	::GetSystemInfo(&info);
+	return (int)info.dwNumberOfProcessors;
 }
 
 void sys_init() {
@@ -72,10 +66,11 @@ struct sProgArgs {
 	int mTestNo;
 	int mTestMode;
 	int mMSAA; // 0:Off, 1:Normal, 2:High
+	int mMaxWrk; // %NUMBER_OF_PROCESSORS%
 
 	sProgArgs()
-	: mTestNo(0), mTestMode(0), mMSAA(1)
-	{}
+	: mTestNo(0), mTestMode(0), mMSAA(1), mMaxWrk(0) {
+	}
 
 	void parse(const char* pCmd);
 };
@@ -84,9 +79,11 @@ void sProgArgs::parse(const char* pCmd) {
 	if (!pCmd) return;
 	size_t len = ::strlen(pCmd);
 	char* pBuf = nxCore::str_dup(pCmd);
-	char* pNext;
+	char* pNext = nullptr;
 	char name[256];
 	char val[256];
+	::memset(name, 0, sizeof(name));
+	::memset(val, 0, sizeof(val));
 	for (char* pTok = ::strtok_s(pBuf, ";", &pNext); pTok; pTok = ::strtok_s(nullptr, ";", &pNext)) {
 		::sscanf_s(pTok, "%[_.a-z0-9] = %[ \\:!$-_./a-zA-Z0-9]", name, (uint32_t)sizeof(name), val, (uint32_t)sizeof(val));
 		if (nxCore::str_eq(name, "test")) {
@@ -101,6 +98,8 @@ void sProgArgs::parse(const char* pCmd) {
 			mTestMode = ::atoi(val);
 		} else if (nxCore::str_eq(name, "msaa")) {
 			mMSAA = ::atoi(val);
+		} else if (nxCore::str_eq(name, "maxwrk")) {
+			mMaxWrk = ::atoi(val);
 		}
 	}
 	nxCore::mem_free(pBuf);
@@ -110,6 +109,30 @@ static sProgArgs s_args;
 
 int get_test_mode() {
 	return s_args.mTestMode;
+}
+
+int get_max_workers() {
+	return s_args.mMaxWrk;
+}
+
+void con_locate(int x, int y) {
+	HANDLE hstd = ::GetStdHandle(STD_OUTPUT_HANDLE);
+	COORD c;
+	c.X = (SHORT)x;
+	c.Y = (SHORT)y;
+	::SetConsoleCursorPosition(hstd, c);
+}
+
+void con_text_color(const cxColor& clr) {
+	HANDLE hstd = ::GetStdHandle(STD_OUTPUT_HANDLE);
+	CONSOLE_SCREEN_BUFFER_INFO info;
+	::GetConsoleScreenBufferInfo(hstd, &info);
+	WORD attr = 0;
+	if (clr.r >= 0.5f) attr |= FOREGROUND_RED;
+	if (clr.g >= 0.5f) attr |= FOREGROUND_GREEN;
+	if (clr.b >= 0.5f) attr |= FOREGROUND_BLUE;
+	if (clr.luma() > 0.5f) attr |= FOREGROUND_INTENSITY;
+	::SetConsoleTextAttribute(hstd, attr);
 }
 
 static struct sMouseState {
@@ -154,6 +177,12 @@ TRACKBALL* get_trackball() {
 
 float get_wheel_val() {
 	return s_mouse.mWheelVal;
+}
+
+static TSK_BRIGADE* s_pBrigade = nullptr;
+
+TSK_BRIGADE* get_brigade() {
+	return s_pBrigade;
 }
 
 void wnd_msg_func(const GEX_WNDMSG& msg) {
@@ -238,6 +267,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR pCmdLine,
 
 	s_args.parse(pCmdLine);
 
+	if (s_args.mMaxWrk <= 0) {
+		s_args.mMaxWrk = get_cpu_count();
+	}
+
+	if (s_args.mMaxWrk > 0) {
+		s_pBrigade = tskBrigadeCreate(s_args.mMaxWrk);
+		if (s_pBrigade) {
+			::printf("Main brigade: %d workers.\n", s_args.mMaxWrk);
+		}
+	}
+
 	TEST_IFC* pTest = &ifc_test1;
 	int w = 1024;
 	int h = 768;
@@ -290,6 +330,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR pCmdLine,
 
 	util_reset();
 	gexReset();
+
+	if (s_pBrigade) {
+		tskBrigadeDestroy(s_pBrigade);
+		s_pBrigade = nullptr;
+	}
 
 	close_console();
 

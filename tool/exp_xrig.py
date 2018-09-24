@@ -32,7 +32,8 @@ def vecAll(vec, val):
 	return True
 
 class RigNode:
-	def __init__(self, hnode, lvl):
+	def __init__(self, xrig, hnode, lvl):
+		self.xrig = xrig
 		self.hnode = hnode
 		self.lvl = lvl
 		self.wmtx = hnode.worldTransform()
@@ -58,9 +59,9 @@ class RigNode:
 	def writeInfo(self, bw):
 		bw.writeI16(self.selfIdx)
 		bw.writeI16(self.parentIdx)
-		bw.writeI16(self.nameId)
-		bw.writeI16(self.pathId)
-		bw.writeU16(self.typeId)
+		self.xrig.writeStrId16(bw, self.nameId)
+		self.xrig.writeStrId16(bw, self.pathId)
+		self.xrig.writeStrId16(bw, self.typeId)
 		bw.writeI16(self.lvl)
 		bw.writeU16(self.attr)
 		bw.writeU8(self.rord)
@@ -70,11 +71,12 @@ class RigExporter(xd.BaseExporter):
 	def __init__(self):
 		xd.BaseExporter.__init__(self)
 		self.sig = "XRIG"
+		self.infoLst = []
 
 	def findNode(self, nodeName):
 		nodeId = -1
 		if self.nodeMap and nodeName in self.nodeMap:
-			nodeId = nodeMap[nodeName]
+			nodeId = self.nodeMap[nodeName]
 		return nodeId
 
 	def build(self, rootPath):
@@ -105,9 +107,12 @@ class RigExporter(xd.BaseExporter):
 
 	def buildSub(self, hnode, lvl):
 		self.nodeMap[hnode.name()] = len(self.nodes)
-		self.nodes.append(RigNode(hnode, lvl))
+		self.nodes.append(RigNode(self, hnode, lvl))
 		for link in hnode.outputConnectors()[0]:
 			self.buildSub(link.outputNode(), lvl+1)
+
+	def addInfo(self, info):
+		self.infoLst.append(info)
 
 	def writeHead(self, bw, top):
 		bw.writeU32(len(self.nodes)) # +20 nodeNum
@@ -120,7 +125,7 @@ class RigExporter(xd.BaseExporter):
 		bw.writeU32(0) # +38 : +10 -> lpos[]
 		bw.writeU32(0) # +3C : +14 -> lrot[]
 		bw.writeU32(0) # +40 : +18 -> lscl[]
-		bw.writeU32(0) # +44 : +1C -> reserved
+		bw.writeU32(0) # +44 : +1C -> info
 
 	def writeData(self, bw, top):
 		bw.align(0x10)
@@ -148,6 +153,18 @@ class RigExporter(xd.BaseExporter):
 			bw.patch(self.patchPos + 0x18, bw.getPos() - top)
 			for node in self.nodes:
 				bw.writeFV(node.lscl)
+		ninf = len(self.infoLst)
+		if ninf > 0:
+			infoOffs = bw.getPos() - top
+			bw.patch(self.patchPos + 0x1C, infoOffs)
+			bw.writeFOURCC("LIST")
+			bw.writeU32(infoOffs + 0x10)
+			bw.writeU32(ninf)
+			bw.writeU32(0)
+			for i in xrange(ninf):
+				self.infoLst[i].writeHead(bw, top, i)
+			for i in xrange(ninf):
+				self.infoLst[i].writeData(bw, top)
 
 if __name__=="__main__":
 	outPath = hou.expandString("$HIP/")

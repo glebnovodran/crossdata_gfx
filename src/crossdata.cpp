@@ -164,8 +164,10 @@ struct sxMemInfo {
 	sxMemInfo* mpPrev;
 	sxMemInfo* mpNext;
 	size_t mSize;
+	size_t mRawSize;
 	uint32_t mTag;
 	uint32_t mOffs;
+	uint32_t mAlgn;
 };
 
 static sxMemInfo* s_pMemHead = nullptr;
@@ -174,17 +176,62 @@ static uint32_t s_allocCount = 0;
 static uint64_t s_allocBytes = 0;
 static uint64_t s_allocPeakBytes = 0;
 
-void* mem_alloc(size_t size, uint32_t tag) {
+sxMemInfo* mem_info_from_addr(void* pMem) {
+	sxMemInfo* pMemInfo = nullptr;
+	if (pMem) {
+		uint8_t* pOffs = (uint8_t*)pMem - sizeof(uint32_t);
+		uint32_t offs = 0;
+		for (int i = 0; i < 4; ++i) {
+			offs |= pOffs[i] << (i * 8);
+		}
+		pMemInfo = (sxMemInfo*)((uint8_t*)pMem - offs);
+	}
+	return pMemInfo;
+}
+
+void* mem_addr_from_info(sxMemInfo* pInfo) {
 	void* p = nullptr;
+	if (pInfo) {
+		p = (uint8_t*)pInfo + pInfo->mOffs;
+	}
+	return p;
+}
+
+sxMemInfo* find_mem_info(void* pMem) {
+	sxMemInfo* pMemInfo = nullptr;
+	sxMemInfo* pCkInfo = mem_info_from_addr(pMem);
+	sxMemInfo* pWkInfo = s_pMemHead;
+	while (pWkInfo) {
+		if (pWkInfo == pCkInfo) {
+			pMemInfo = pWkInfo;
+			pWkInfo = nullptr;
+		} else {
+			pWkInfo = pWkInfo->mpNext;
+		}
+	}
+	return pMemInfo;
+}
+
+void* mem_alloc(size_t size, uint32_t tag, int alignment) {
+	void* p = nullptr;
+	if (alignment < 1) alignment = 0x10;
 	if (size > 0) {
-		size_t asize = XD_ALIGN(size + sizeof(sxMemInfo) + 0x10, 0x10);
+		size_t asize = nxCore::align_pad(size + sizeof(sxMemInfo) + alignment + sizeof(uint32_t), alignment);
 		void* p0 = nxSys::malloc(asize);
 		if (p0) {
-			p = (void*)XD_ALIGN((intptr_t)((uint8_t*)p0 + sizeof(sxMemInfo)), 0x10);
-			sxMemInfo* pInfo = &((sxMemInfo*)p)[-1];
+			p = (void*)nxCore::align_pad((uintptr_t)((uint8_t*)p0 + sizeof(sxMemInfo) + sizeof(uint32_t)), alignment);
+			uint32_t offs = (uint32_t)((uint8_t*)p - (uint8_t*)p0);
+			uint8_t* pOffs = (uint8_t*)p - sizeof(uint32_t);
+			pOffs[0] = offs & 0xFF;
+			pOffs[1] = (offs >> 8) & 0xFF;
+			pOffs[2] = (offs >> 16) & 0xFF;
+			pOffs[3] = (offs >> 24) & 0xFF;
+			sxMemInfo* pInfo = mem_info_from_addr(p);
+			pInfo->mRawSize = asize;
 			pInfo->mSize = size;
 			pInfo->mTag = tag;
-			pInfo->mOffs = (uint32_t)((uint8_t*)p - (uint8_t*)p0);
+			pInfo->mOffs = offs;
+			pInfo->mAlgn = alignment;
 			pInfo->mpPrev = nullptr;
 			pInfo->mpNext = nullptr;
 			if (!s_pMemHead) {
@@ -204,9 +251,58 @@ void* mem_alloc(size_t size, uint32_t tag) {
 	return p;
 }
 
+void* mem_realloc(void* pMem, size_t newSize, int alignment) {
+	void* pNewMem = pMem;
+	if (pMem && newSize) {
+		sxMemInfo* pMemInfo = find_mem_info(pMem);
+		if (pMemInfo) {
+			uint32_t oldTag = pMemInfo->mTag;
+			size_t oldSize = pMemInfo->mSize;
+			size_t cpySize = nxCalc::min(oldSize, newSize);
+			if (alignment < 1) alignment = pMemInfo->mAlgn;
+			void* p = mem_alloc(newSize, oldTag, alignment);
+			if (p) {
+				pNewMem = p;
+				::memcpy(pNewMem, pMem, cpySize);
+				mem_free(pMem);
+			}
+		} else {
+			dbg_msg("invalid realloc request: %p\n", pMem);
+		}
+	}
+	return pNewMem;
+}
+
+void* mem_resize(void* pMem, float factor, int alignment) {
+	void* pNewMem = pMem;
+	if (pMem && factor > 0.0f) {
+		sxMemInfo* pMemInfo = find_mem_info(pMem);
+		if (pMemInfo) {
+			uint32_t oldTag = pMemInfo->mTag;
+			size_t oldSize = pMemInfo->mSize;
+			size_t newSize = (size_t)::ceilf((float)oldSize * factor);
+			size_t cpySize = nxCalc::min(oldSize, newSize);
+			if (alignment < 1) alignment = pMemInfo->mAlgn;
+			void* p = mem_alloc(newSize, oldTag, alignment);
+			if (p) {
+				pNewMem = p;
+				::memcpy(pNewMem, pMem, cpySize);
+				mem_free(pMem);
+			}
+		} else {
+			dbg_msg("memory @ %p cannot be resized\n", pMem);
+		}
+	}
+	return pNewMem;
+}
+
 void mem_free(void* pMem) {
 	if (!pMem) return;
-	sxMemInfo* pInfo = &((sxMemInfo*)pMem)[-1];
+	sxMemInfo* pInfo = find_mem_info(pMem);
+	if (!pInfo) {
+		dbg_msg("cannot free memory @ %p\n", pMem);
+		return;
+	}
 	sxMemInfo* pNext = pInfo->mpNext;
 	if (pInfo->mpPrev) {
 		pInfo->mpPrev->mpNext = pNext;
@@ -229,15 +325,33 @@ void mem_free(void* pMem) {
 	--s_allocCount;
 }
 
+size_t mem_size(void* pMem) {
+	size_t size = 0;
+	sxMemInfo* pMemInfo = find_mem_info(pMem);
+	if (pMemInfo) {
+		size = pMemInfo->mSize;
+	}
+	return size;
+}
+
+uint32_t mem_tag(void* pMem) {
+	uint32_t tag = 0;
+	sxMemInfo* pMemInfo = find_mem_info(pMem);
+	if (pMemInfo) {
+		tag = pMemInfo->mTag;
+	}
+	return tag;
+}
+
 void mem_dbg() {
 	dbg_msg("%d allocs\n", s_allocCount);
 	sxMemInfo* pInfo = s_pMemHead;
 	char tag[5];
 	tag[4] = 0;
 	while (pInfo) {
-		void* pMem = pInfo + 1;
+		void* pMem = mem_addr_from_info(pInfo);
 		::memcpy(tag, &pInfo->mTag, 4);
-		dbg_msg("%s @ %p, size=0x%X\n", tag, pMem, pInfo->mSize);
+		dbg_msg("%s @ %p, size=0x%X (0x%X, 0x%X)\n", tag, pMem, pInfo->mSize, pInfo->mRawSize, pInfo->mAlgn);
 		if (pInfo->mTag == XD_DAT_MEM_TAG) {
 			sxData* pData = (sxData*)pMem;
 			::memcpy(tag, &pData->mKind, 4);
@@ -260,7 +374,7 @@ void dbg_msg(const char* fmt, ...) {
 	nxSys::dbgmsg(msg);
 }
 
-void* bin_load(const char* pPath, size_t* pSize, bool appendPath) {
+void* bin_load(const char* pPath, size_t* pSize, bool appendPath, bool unpack) {
 	void* pData = nullptr;
 	size_t size = 0;
 	XD_FHANDLE fh = nxSys::fopen(pPath);
@@ -276,7 +390,27 @@ void* bin_load(const char* pPath, size_t* pSize, bool appendPath) {
 			size = nxSys::fread(fh, pData, fsize);
 		}
 		nxSys::fclose(fh);
-		if (appendPath) {
+		if (pData && unpack && fsize > sizeof(sxPackedData)) {
+			sxPackedData* pPkd = (sxPackedData*)pData;
+			if (pPkd->mSig == sxPackedData::SIG && pPkd->mPackSize == fsize) {
+				size_t memsize0 = memsize;
+				memsize = pPkd->mRawSize;
+				if (appendPath) {
+					memsize += pathLen + 1;
+				}
+				uint8_t* pUnpkd = (uint8_t*)mem_alloc(memsize, XD_DAT_MEM_TAG);
+				if (nxData::unpack(pPkd, XD_DAT_MEM_TAG, pUnpkd, (uint32_t)memsize)) {
+					size = pPkd->mRawSize;
+					fsize = size;
+					mem_free(pData);
+					pData = pUnpkd;
+				} else {
+					mem_free(pUnpkd);
+					memsize = memsize0;
+				}
+			}
+		}
+		if (pData && appendPath) {
 			nxSys::x_strcpy(&((char*)pData)[fsize], pathLen + 1, pPath);
 		}
 	}
@@ -301,6 +435,7 @@ void bin_save(const char* pPath, const void* pMem, size_t size) {
 
 // http://www.isthe.com/chongo/tech/comp/fnv/index.html
 uint32_t str_hash32(const char* pStr) {
+	if (!pStr) return 0;
 	uint32_t h = 2166136261;
 	while (true) {
 		uint8_t c = *pStr++;
@@ -394,7 +529,7 @@ float half_to_float(uint16_t h) {
 	}
 	return f;
 }
-	
+
 float f32_set_bits(uint32_t x) {
 	uxVal32 v;
 	v.u = x;
@@ -414,6 +549,52 @@ uint32_t fetch_bits32(uint8_t* pTop, uint32_t org, uint32_t len) {
 	res >>= org & 7;
 	res &= (1ULL << len) - 1;
 	return (uint32_t)res;
+}
+
+static sxRNG s_rng = { /* seed(1) -> */ 0x910A2DEC89025CC1ULL, 0xBEEB8DA1658EEC67ULL };
+
+void rng_seed(sxRNG* pState, uint64_t seed) {
+	if (!pState) {
+		pState = &s_rng;
+	}
+	if (seed == 0) {
+		seed = 1;
+	}
+	uint64_t st = seed;
+	for (int i = 0; i < 2; ++i) {
+		/* splitmix64 */
+		st += 0x9E3779B97F4A7C15ULL;
+		uint64_t z = st;
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		z ^= (z >> 31);
+		pState->s[i] = z;
+	}
+}
+
+/* xoroshiro128+ */
+uint64_t rng_next(sxRNG* pState) {
+	if (!pState) {
+		pState = &s_rng;
+	}
+	uint64_t s0 = pState->s[0];
+	uint64_t s1 = pState->s[1];
+	uint64_t r = s0 + s1;
+	s1 ^= s0;
+	s0 = (s0 << 55) | (s0 >> 9);
+	s0 ^= s1 ^ (s1 << 14);
+	s1 = (s1 << 36) | (s1 >> 28);
+	pState->s[0] = s0;
+	pState->s[1] = s1;
+	return r;
+}
+
+float rng_f01(sxRNG* pState) {
+	uint32_t bits = (uint32_t)rng_next(pState);
+	bits &= 0x7FFFFF;
+	bits |= f32_get_bits(1.0f);
+	float f = f32_set_bits(bits);
+	return f - 1.0f;
 }
 
 } // nxCore
@@ -442,7 +623,8 @@ float hermite(float p0, float m0, float p1, float m1, float t) {
 }
 
 float fit(float val, float oldMin, float oldMax, float newMin, float newMax) {
-	float rel = (val - oldMin) / (oldMax - oldMin);
+	float rel = div0(val - oldMin, oldMax - oldMin);
+	rel = saturate(rel);
 	return lerp(newMin, newMax, rel);
 }
 
@@ -551,6 +733,19 @@ cxVec get_axis(exAxis axis) {
 	return v;
 }
 
+cxVec from_polar_uv(float u, float v) {
+	float azimuth = u * 2.0f * XD_PI;
+	float sinAzi = ::sinf(azimuth);
+	float cosAzi = ::cosf(azimuth);
+	float elevation = (v - 1.0f) * XD_PI;
+	float sinEle = ::sinf(elevation);
+	float cosEle = ::cosf(elevation);
+	float nx = cosAzi*sinEle;
+	float ny = cosEle;
+	float nz = sinAzi*sinEle;
+	return cxVec(nx, ny, nz);
+}
+
 cxVec reflect(const cxVec& vec, const cxVec& nrm) {
 	return vec - nrm*vec.dot(nrm)*2.0f;
 }
@@ -569,7 +764,7 @@ void cxVec::parse(const char* pStr) {
 	set(val[0], val[1], val[2]);
 }
 
-// http://www.insomniacgames.com/mike-day-vector-length-and-normalization-difficulties/
+// Ref: Mike Day, "Vector length and normalization difficulties"
 float cxVec::mag() const {
 	cxVec v = *this;
 	float m = v.max_abs_elem();
@@ -592,8 +787,10 @@ void cxVec::normalize(const cxVec& v) {
 	*this = n;
 }
 
-// http://lgdv.cs.fau.de/publications/publication/Pub.2010.tech.IMMD.IMMD9.onfloa/
-// http://jcgt.org/published/0003/02/01/
+// Refs:
+//   Meyer et al. "On floating-point normal vectors"
+//   Cigolle et al. "A Survey of Efficient Representations for Independent Unit Vectors"
+//   http://jcgt.org/published/0003/02/01/
 xt_float2 cxVec::encode_octa() const {
 	xt_float2 oct;
 	cxVec av = abs_val();
@@ -771,6 +968,23 @@ void cxMtx::transpose_sr(const cxMtx& mtx) {
 }
 
 void cxMtx::invert() {
+#if XD_USE_LA
+	int idx[4 * 3];
+	bool ok = nxLA::inv_gj((float*)this, 4, idx);
+	if (!ok) {
+		::memset(*this, 0, sizeof(cxMtx));
+	}
+#else
+	invert_fast();
+#endif
+}
+
+void cxMtx::invert(const cxMtx& mtx) {
+	::memcpy(this, mtx, sizeof(cxMtx));
+	invert();
+}
+
+void cxMtx::invert_fast() {
 	float det;
 	float a0, a1, a2, a3, a4, a5;
 	float b0, b1, b2, b3, b4, b5;
@@ -817,17 +1031,48 @@ void cxMtx::invert() {
 		im.m[3][3] =  m[2][0]*a3 - m[2][1]*a1 + m[2][2]*a0;
 
 		float idet = 1.0f / det;
-		for (int i = 0; i < 4; ++i) {
-			for (int j = 0; j < 4; ++j) {
-				m[i][j] = im.m[i][j] * idet;
-			}
+		float* pDst = &m[0][0];
+		float* pSrc = &im.m[0][0];
+		for (int i = 0; i < 4 * 4; ++i) {
+			pDst[i] = pSrc[i] * idet;
 		}
 	}
 }
 
-void cxMtx::invert(const cxMtx& mtx) {
-	::memcpy(this, mtx, sizeof(cxMtx));
-	invert();
+void cxMtx::invert_lu() {
+	float lu[4 * 4];
+	nxLA::mtx_cpy(lu, (float*)this, 4, 4);
+	float wk[4];
+	int idx[4];
+	bool ok = nxLA::lu_decomp(lu, 4, wk, idx);
+	if (!ok) {
+		::memset(*this, 0, sizeof(cxMtx));
+		return;
+	}
+	for (int i = 0; i < 4; ++i) {
+		nxLA::lu_solve(m[i], lu, nxCalc::s_identityMtx[i], idx, 4);
+	}
+	transpose();
+}
+
+void cxMtx::invert_lu_hi() {
+	double lu[4 * 4];
+	nxLA::mtx_cpy(lu, (float*)this, 4, 4);
+	double wk[4];
+	int idx[4];
+	bool ok = nxLA::lu_decomp(lu, 4, wk, idx);
+	if (!ok) {
+		::memset(*this, 0, sizeof(cxMtx));
+		return;
+	}
+	double inv[4][4];
+	double b[4][4];
+	nxLA::mtx_cpy(&b[0][0], &nxCalc::s_identityMtx[0][0], 4, 4);
+	for (int i = 0; i < 4; ++i) {
+		nxLA::lu_solve(inv[i], lu, b[i], idx, 4);
+	}
+	nxLA::mtx_cpy((float*)this, &inv[0][0], 4, 4);
+	transpose();
 }
 
 void cxMtx::mul(const cxMtx& mtx) {
@@ -835,6 +1080,11 @@ void cxMtx::mul(const cxMtx& mtx) {
 }
 
 void cxMtx::mul(const cxMtx& m1, const cxMtx& m2) {
+#if XD_USE_LA
+	float res[4 * 4];
+	nxLA::mul_mm(res, (const float*)m1, (const float*)m2, 4, 4, 4);
+	from_mem(res);
+#else
 	cxMtx m0;
 	m0.m[0][0] = m1.m[0][0]*m2.m[0][0] + m1.m[0][1]*m2.m[1][0] + m1.m[0][2]*m2.m[2][0] + m1.m[0][3]*m2.m[3][0];
 	m0.m[0][1] = m1.m[0][0]*m2.m[0][1] + m1.m[0][1]*m2.m[1][1] + m1.m[0][2]*m2.m[2][1] + m1.m[0][3]*m2.m[3][1];
@@ -857,6 +1107,33 @@ void cxMtx::mul(const cxMtx& m1, const cxMtx& m2) {
 	m0.m[3][3] = m1.m[3][0]*m2.m[0][3] + m1.m[3][1]*m2.m[1][3] + m1.m[3][2]*m2.m[2][3] + m1.m[3][3]*m2.m[3][3];
 
 	*this = m0;
+#endif
+}
+
+// Ref: http://graphics.pixar.com/library/OrthonormalB/paper.pdf
+void cxMtx::from_upvec(const cxVec& n) {
+	float s = n.z < 0 ? -1.0f : 1.0f;
+	float a = -1.0f / (s - n.z);
+	float b = n.x * n.y * a;
+	cxVec nx(1.0f + s*n.x*n.x*a, s*b, s*n.x);
+	cxVec nz(b, s + n.y*n.y*a, n.y);
+	set_rot_frame(nx, n, nz);
+}
+
+void cxMtx::orient_zy(const cxVec& axisZ, const cxVec& axisY, bool normalizeInput) {
+	cxVec az = normalizeInput ? axisZ.get_normalized() : axisZ;
+	cxVec ay = normalizeInput ? axisY.get_normalized() : axisY;
+	cxVec ax = nxVec::cross(ay, az).get_normalized();
+	ay = nxVec::cross(az, ax).get_normalized();
+	set_rot_frame(ax, ay, az);
+}
+
+void cxMtx::orient_zx(const cxVec& axisZ, const cxVec& axisX, bool normalizeInput) {
+	cxVec az = normalizeInput ? axisZ.get_normalized() : axisZ;
+	cxVec ax = normalizeInput ? axisX.get_normalized() : axisX;
+	cxVec ay = nxVec::cross(az, ax).get_normalized();
+	ax = nxVec::cross(ay, az).get_normalized();
+	set_rot_frame(ax, ay, az);
 }
 
 void cxMtx::set_rot_frame(const cxVec& axisX, const cxVec& axisY, const cxVec& axisZ) {
@@ -960,6 +1237,30 @@ void cxMtx::set_rot_degrees(const cxVec& r, exRotOrd ord) {
 	set_rot(rr.x, rr.y, rr.z, ord);
 }
 
+bool cxMtx::is_valid_rot(float tol) const {
+	cxVec r0 = get_row_vec(0);
+	cxVec r1 = get_row_vec(1);
+	cxVec r2 = get_row_vec(2);
+	float v = ::fabsf(nxVec::scalar_triple(r0, r1, r2));
+	if (::fabsf(v - 1.0f) > tol) return false;
+
+	v = r0.dot(r0);
+	if (::fabsf(v - 1.0f) > tol) return false;
+	v = r1.dot(r1);
+	if (::fabsf(v - 1.0f) > tol) return false;
+	v = r2.dot(r2);
+	if (::fabsf(v - 1.0f) > tol) return false;
+
+	v = r0.dot(r1);
+	if (::fabsf(v) > tol) return false;
+	v = r1.dot(r2);
+	if (::fabsf(v) > tol) return false;
+	v = r0.dot(r2);
+	if (::fabsf(v) > tol) return false;
+
+	return true;
+}
+
 static inline float limit_pi(float rad) {
 	rad = ::fmodf(rad, XD_PI*2);
 	if (::fabsf(rad) > XD_PI) {
@@ -1033,7 +1334,7 @@ cxVec cxMtx::get_rot(exRotOrd ord) const {
 	float r[3] = { 0, 0, 0 };
 	r[i0] = ::atan2f(rm[1][2], rm[2][2]);
 	r[i1] = ::atan2f(-rm[0][2], ::sqrtf(nxCalc::sq(rm[0][0]) + nxCalc::sq(rm[0][1])));
-	// http://www.insomniacgames.com/mike-day-extracting-euler-angles-from-a-rotation-matrix/
+	// Ref: Mike Day, "Extracting Euler Angles from a Rotation Matrix"
 	float s = ::sinf(r[i0]);
 	float c = ::cosf(r[i0]);
 	r[i2] = ::atan2f(s*rm[2][0] - c*rm[1][0], c*rm[1][1] - s*rm[2][1]);
@@ -1155,6 +1456,11 @@ void cxMtx::mk_proj(float fovy, float aspect, float znear, float zfar) {
 }
 
 cxVec cxMtx::calc_vec(const cxVec& v) const {
+#if XD_USE_LA
+	float res[4];
+	nxLA::mul_vm(res, (float*)&v, (float*)m, 3, 4);
+	return nxVec::from_mem(res);
+#else
 	float x = v.x;
 	float y = v.y;
 	float z = v.z;
@@ -1162,9 +1468,16 @@ cxVec cxMtx::calc_vec(const cxVec& v) const {
 	float ty = x*m[0][1] + y*m[1][1] + z*m[2][1];
 	float tz = x*m[0][2] + y*m[1][2] + z*m[2][2];
 	return cxVec(tx, ty, tz);
+#endif
 }
 
 cxVec cxMtx::calc_pnt(const cxVec& v) const {
+#if XD_USE_LA
+	float vec[4] = { v.x, v.y, v.z, 1.0f };
+	float res[4];
+	nxLA::mul_vm(res, vec, (float*)m, 4, 4);
+	return nxVec::from_mem(res);
+#else
 	float x = v.x;
 	float y = v.y;
 	float z = v.z;
@@ -1172,6 +1485,7 @@ cxVec cxMtx::calc_pnt(const cxVec& v) const {
 	float ty = x*m[0][1] + y*m[1][1] + z*m[2][1] + m[3][1];
 	float tz = x*m[0][2] + y*m[1][2] + z*m[2][2] + m[3][2];
 	return cxVec(tx, ty, tz);
+#endif
 }
 
 xt_float4 cxMtx::apply(const xt_float4& qv) const {
@@ -1309,6 +1623,10 @@ void cxQuat::set_rot(float rx, float ry, float rz, exRotOrd ord) {
 	}
 }
 
+void cxQuat::set_rot_degrees(float dx, float dy, float dz, exRotOrd ord) {
+	set_rot_degrees(cxVec(dx, dy, dz), ord);
+}
+
 void cxQuat::set_rot_degrees(const cxVec& r, exRotOrd ord) {
 	cxVec rr = r * XD_DEG2RAD(1.0f);
 	set_rot(rr.x, rr.y, rr.z, ord);
@@ -1409,6 +1727,203 @@ cxVec cxQuat::apply(const cxVec& v) const {
 	float d = qv.dot(v);
 	float ww = w*w;
 	return ((qv*d + v*ww) - nxVec::cross(v, qv)*w)*2.0f - v;
+}
+
+// http://www.geometrictools.com/Documentation/ConstrainedQuaternions.pdf
+
+static inline cxQuat closest_quat_by_axis(const cxQuat& qsrc, int axis) {
+	cxQuat qres;
+	qres.identity();
+	float e = qsrc.get_at(axis);
+	float w = qsrc.w;
+	float sqmag = nxCalc::sq(e) + nxCalc::sq(w);
+	if (sqmag > 0.0f) {
+		float s = nxCalc::rcp0(::sqrtf(sqmag));
+		qres.set_at(axis, e*s);
+		qres.w = w*s;
+	}
+	return qres;
+}
+
+cxQuat cxQuat::get_closest_x() const { return closest_quat_by_axis(*this, 0); }
+
+cxQuat cxQuat::get_closest_y() const { return closest_quat_by_axis(*this, 1); }
+
+cxQuat cxQuat::get_closest_z() const { return closest_quat_by_axis(*this, 2); }
+
+cxQuat cxQuat::get_closest_xy() const {
+	cxQuat q;
+	float det = ::fabsf(-x*y - z*w);
+	float s;
+	if (det < 0.5f) {
+		float d = ::sqrtf(::fabsf(1.0f - 4.0f*nxCalc::sq(det)));
+		float a = x*w - y*z;
+		float b = nxCalc::sq(w) - nxCalc::sq(x) + nxCalc::sq(y) - nxCalc::sq(z);
+		float s0, c0;
+		if (b >= 0.0f) {
+			s0 = a;
+			c0 = (d + b)*0.5f;
+		} else {
+			s0 = (d - b)*0.5f;
+			c0 = a;
+		}
+		s = nxCalc::rcp0(nxCalc::hypot(s0, c0));
+		s0 *= s;
+		c0 *= s;
+
+		float s1 = y*c0 - z*s0;
+		float c1 = w*c0 + x*s0;
+		s = nxCalc::rcp0(nxCalc::hypot(s1, c1));
+		s1 *= s;
+		c1 *= s;
+
+		q.set(s0*c1, c0*s1, -s0*s1, c0*c1);
+	} else {
+		s = nxCalc::rcp0(::sqrtf(det));
+		q.set(x*s, 0.0f, 0.0f, w*s);
+	}
+	return q;
+}
+
+cxQuat cxQuat::get_closest_yx() const {
+	cxQuat q = cxQuat(x, y, -z, w).get_closest_xy();
+	q.z = -q.z;
+	return q;
+}
+
+cxQuat cxQuat::get_closest_xz() const {
+	cxQuat q = cxQuat(x, z, y, w).get_closest_yx();
+	float t = q.y;
+	q.y = q.z;
+	q.z = t;
+	return q;
+}
+
+cxQuat cxQuat::get_closest_zx() const {
+	cxQuat q = cxQuat(x, z, y, w).get_closest_xy();
+	float t = q.y;
+	q.y = q.z;
+	q.z = t;
+	return q;
+}
+
+cxQuat cxQuat::get_closest_yz() const {
+	cxQuat q = cxQuat(y, z, x, w).get_closest_xy();
+	return cxQuat(q.z, q.x, q.y, q.w);
+}
+
+cxQuat cxQuat::get_closest_zy() const {
+	cxQuat q = cxQuat(y, z, x, w).get_closest_yx();
+	return cxQuat(q.z, q.x, q.y, q.w);
+}
+
+
+namespace nxQuat {
+
+cxQuat log(const cxQuat& q) {
+	float m = q.mag();
+	float w = ::logf(m);
+	cxVec v = q.get_imag_part();
+	float s = v.mag();
+	s = s < 1.0e-5f ? 1.0f : ::atan2f(s, q.get_real_part()) / s;
+	v.scl(s);
+	return cxQuat(v.x, v.y, v.z, w);
+}
+
+cxQuat exp(const cxQuat& q) {
+	cxVec v = q.get_imag_part();
+	float e = ::expf(q.get_real_part());
+	float h = v.mag();
+	float c = ::cosf(h);
+	float s = ::sinf(h);
+	v.normalize();
+	v.scl(s);
+	return cxQuat(v.x, v.y, v.z, c).get_scaled(e);
+}
+
+cxQuat pow(const cxQuat& q, float x) {
+	if (q.mag() < 1.0e-5f) return nxQuat::zero();
+	return exp(log(q).get_scaled(x));
+}
+
+float arc_dist(const cxQuat& a, const cxQuat& b) {
+	double ax = a.x;
+	double ay = a.y;
+	double az = a.z;
+	double aw = a.w;
+	double bx = b.x;
+	double by = b.y;
+	double bz = b.z;
+	double bw = b.w;
+	double d = ::fabs(ax*bx + ay*by + az*bz + aw*bw);
+	if (d > 1.0) d = 1.0;
+	d = ::acos(d) / (XD_PI / 2.0);
+	return float(d);
+}
+
+} // nxQuat
+
+
+void cxDualQuat::mul(const cxDualQuat& dq) {
+	cxQuat r0 = mReal;
+	cxQuat d0 = mDual;
+	cxQuat r1 = dq.mReal;
+	cxQuat d1 = dq.mDual;
+	mReal = (r1 * r0).get_normalized();
+	mDual = d1*r0 + r1*d0;
+}
+
+cxVec cxDualQuat::calc_pnt(const cxVec& pos) const {
+	cxQuat t(pos.x, pos.y, pos.z, 0.0f);
+	t.scl(0.5f);
+	cxQuat d = mDual;
+	d.add(mReal * t);
+	d.scl(2.0f);
+	d.mul(mReal.get_conjugate());
+	return d.get_vector_part();
+}
+
+void cxDualQuat::interpolate(const cxDualQuat& dqA, const cxDualQuat& dqB, float t) {
+	cxDualQuat b = dqB;
+	float ab = dqA.mReal.dot(dqB.mReal);
+	if (ab < 0.0f) {
+		b.mReal.negate();
+		b.mDual.negate();
+		ab = -ab;
+	}
+
+	if (1.0f - ab < 1.0e-6f) {
+		mReal.lerp(dqA.mReal, dqB.mReal, t);
+		mDual.lerp(dqA.mDual, dqB.mDual, t);
+		normalize();
+		return;
+	}
+
+	cxDualQuat d;
+	d.mReal = dqA.mReal.get_conjugate();
+	d.mDual = dqA.mDual.get_conjugate();
+	d.mul(b);
+
+	cxVec vr = d.mReal.get_vector_part();
+	cxVec vd = d.mDual.get_vector_part();
+	float ir = nxCalc::rcp0(vr.mag());
+	float ang = 2.0f * ::acosf(d.mReal.w);
+	float tns = -2.0f * d.mDual.w * ir;
+	cxVec dir = vr * ir;
+	cxVec mom = (vd - dir*tns*d.mReal.w*0.5f) * ir;
+
+	ang *= t;
+	tns *= t;
+	float ha = ang * 0.5f;
+	float sh = ::sinf(ha);
+	float ch = ::cosf(ha);
+
+	cxDualQuat r;
+	r.mReal.from_parts(dir * sh, ch);
+	r.mDual.from_parts(mom*sh + dir*ch*tns*0.5f, -tns*0.5f*sh);
+
+	*this = dqA;
+	mul(r);
 }
 
 
@@ -2047,6 +2562,365 @@ bool cxFrustum::overlaps(const cxAABB& box) const {
 }
 
 
+namespace nxColor {
+
+void init_XYZ_transform(cxMtx* pRGB2XYZ, cxMtx* pXYZ2RGB, cxVec* pPrims, cxVec* pWhite) {
+	cxVec rx, ry, rz;
+	if (pPrims) {
+		rx = pPrims[0];
+		ry = pPrims[1];
+		rz = pPrims[2];
+	} else {
+		/* 709 primaries */
+		rx.set(0.640f, 0.330f, 0.030f);
+		ry.set(0.300f, 0.600f, 0.100f);
+		rz.set(0.150f, 0.060f, 0.790f);
+	}
+
+	cxVec w;
+	if (pWhite) {
+		w = *pWhite;
+	} else {
+		/* D65 1931 */
+		w.set(0.3127f, 0.3290f, 0.3582f);
+	}
+	w.scl(nxCalc::rcp0(w.y));
+
+	cxMtx cm;
+	cm.set_rot_frame(rx, ry, rz);
+
+	cxMtx im = cm.get_inverted();
+	cxVec j = im.calc_vec(w);
+	cxMtx tm;
+	tm.mk_scl(j);
+	tm.mul(cm);
+	if (pRGB2XYZ) {
+		*pRGB2XYZ = tm;
+	}
+	if (pXYZ2RGB) {
+		*pXYZ2RGB = tm.get_inverted();
+	}
+}
+
+void init_XYZ_transform_xy_w(cxMtx* pRGB2XYZ, cxMtx* pXYZ2RGB, float wx, float wy) {
+	cxVec w(wx, wy, 1.0f - (wx + wy));
+	init_XYZ_transform(pRGB2XYZ, pXYZ2RGB, nullptr, &w);
+}
+
+void init_XYZ_transform_xy(cxMtx* pRGB2XYZ, cxMtx* pXYZ2RGB, float rx, float ry, float gx, float gy, float bx, float by, float wx, float wy) {
+	cxVec prims[3];
+	prims[0].set(rx, ry, 1.0f - (rx + ry));
+	prims[1].set(gx, gy, 1.0f - (gx + gy));
+	prims[2].set(bx, by, 1.0f - (bx + by));
+	cxVec white(wx, wy, 1.0f - (wx + wy));
+	init_XYZ_transform(pRGB2XYZ, pXYZ2RGB, prims, &white);
+}
+
+cxVec XYZ_to_Lab(const cxVec& xyz, cxMtx* pRGB2XYZ) {
+	cxVec white = cxColor(1.0f).XYZ(pRGB2XYZ);
+	cxVec l = xyz * nxVec::rcp0(white);
+	for (int i = 0; i < 3; ++i) {
+		float e = l.get_at(i);
+		if (e > 0.008856f) {
+			e = nxCalc::cb_root(e);
+		} else {
+			e = e*7.787f + (16.0f / 116);
+		}
+		l.set_at(i, e);
+	}
+	float lx = l.x;
+	float ly = l.y;
+	float lz = l.z;
+	return cxVec(116.0f*ly - 16.0f, 500.0f*(lx - ly), 200.0f*(ly - lz));
+}
+
+cxVec Lab_to_XYZ(const cxVec& lab, cxMtx* pRGB2XYZ) {
+	cxVec white = cxColor(1.0f).XYZ(pRGB2XYZ);
+	float L = lab.x;
+	float a = lab.y;
+	float b = lab.z;
+	float ly = (L + 16.0f) / 116.0f;
+	cxVec t(a/500.0f + ly, ly, -b/200.0f + ly);
+	for (int i = 0; i < 3; ++i) {
+		float e = t.get_at(i);
+		if (e > 0.206893f) {
+			e = nxCalc::cb(e);
+		} else {
+			e = (e - (16.0f/116)) / 7.787f;
+		}
+		t.set_at(i, e);
+	}
+	t.mul(white);
+	return t;
+}
+
+cxVec Lab_to_Lch(const cxVec& lab) {
+	float L = lab.x;
+	float a = lab.y;
+	float b = lab.z;
+	float c = nxCalc::hypot(a, b);
+	float h = ::atan2f(b, a);
+	return cxVec(L, c, h);
+}
+
+cxVec Lch_to_Lab(const cxVec& lch) {
+	float L = lch.x;
+	float c = lch.y;
+	float h = lch.z;
+	float hs = ::sinf(h);
+	float hc = ::cosf(h);
+	return cxVec(L, c*hc, c*hs);
+}
+
+float Lch_perceived_lightness(const cxVec& lch) {
+	float L = lch.x;
+	float c = lch.y;
+	float h = lch.z;
+	float fh = ::fabsf(::sinf((h - (XD_PI*0.5f)) * 0.5f))*0.116f + 0.085f;
+	float fL = 2.5f - (2.5f/100)*L; // 1 at 60, 0 at 100 (white)
+	return L + fh*fL*c;
+}
+
+
+// Single-Lobe CMF fits from Wyman et al. "Simple Analytic Approximations to the CIE XYZ Color Matching Functions"
+
+float approx_CMF_x31(float w) {
+	return 1.065f*::expf(-0.5f * nxCalc::sq((w - 595.8f) / 33.33f)) + 0.366f*::expf(-0.5f * nxCalc::sq((w - 446.8f) / 19.44f));
+}
+
+float approx_CMF_y31(float w) {
+	return 1.014f*::expf(-0.5f * nxCalc::sq((::logf(w) - 6.32130766f) / 0.075f));
+}
+
+float approx_CMF_z31(float w) {
+	return 1.839f*::expf(-0.5f * nxCalc::sq((::logf(w) - 6.1088028f) / 0.051f));
+}
+
+float approx_CMF_x64(float w) {
+	return 0.398f*::expf(-1250.0f * nxCalc::sq(::logf((w + 570.1f) / 1014.0f))) + 1.132f*::expf(-234.0f * nxCalc::sq(::logf((1338.0f - w) / 743.5f)));
+}
+
+float approx_CMF_y64(float w) {
+	return 1.011f*::expf(-0.5f * nxCalc::sq((w - 556.1f) / 46.14f));
+}
+
+float approx_CMF_z64(float w) {
+	return 2.06f*::expf(-32.0f * nxCalc::sq(::logf((w - 265.8f) / 180.4f)));
+}
+
+} // nxColor
+
+cxVec cxColor::YCgCo() const {
+	cxVec rgb(r, g, b);
+	return cxVec(
+		rgb.dot(cxVec(0.25f, 0.5f, 0.25f)),
+		rgb.dot(cxVec(-0.25f, 0.5f, -0.25f)),
+		rgb.dot(cxVec(0.5f, 0.0f, -0.5f))
+	);
+}
+
+void cxColor::from_YCgCo(const cxVec& ygo) {
+	float Y = ygo[0];
+	float G = ygo[1];
+	float O = ygo[2];
+	float t = Y - G;
+	r = t + O;
+	g = Y + G;
+	b = t - O;
+}
+
+cxVec cxColor::TMI() const {
+	float T = b - r;
+	float M = (r - g*2.0f + b) * 0.5f;
+	float I = (r + g + b) / 3.0f;
+	return cxVec(T, M, I);
+}
+
+void cxColor::from_TMI(const cxVec& tmi) {
+	float T = tmi[0];
+	float M = tmi[1];
+	float I = tmi[2];
+	r = I - T*0.5f + M/3.0f;
+	g = I - M*2.0f/3.0f;
+	b = I + T*0.5f + M/3.0f;
+}
+
+static inline cxMtx* mtx_RGB2XYZ(cxMtx* pRGB2XYZ) {
+	static float tm709[] = {
+		0.412453f, 0.212671f, 0.019334f, 0.0f,
+		0.357580f, 0.715160f, 0.119193f, 0.0f,
+		0.180423f, 0.072169f, 0.950227f, 0.0f,
+		0.0f, 0.0f, 0.0f, 1.0f
+	};
+	return pRGB2XYZ ? pRGB2XYZ : (cxMtx*)tm709;
+}
+
+static inline cxMtx* mtx_XYZ2RGB(cxMtx* pXYZ2RGB) {
+	static float im709[] = {
+		 3.240479f, -0.969256f,  0.055648f, 0.0f,
+		-1.537150f,  1.875992f, -0.204043f, 0.0f,
+		-0.498535f,  0.041556f,  1.057311f, 0.0f,
+		 0.0f, 0.0f, 0.0f, 1.0f
+	};
+	return pXYZ2RGB ? pXYZ2RGB : (cxMtx*)im709;
+}
+
+cxVec cxColor::XYZ(cxMtx* pRGB2XYZ) const {
+	return mtx_RGB2XYZ(pRGB2XYZ)->calc_vec(cxVec(r, g, b));
+}
+
+void cxColor::from_XYZ(const cxVec& xyz, cxMtx* pXYZ2RGB) {
+	set(mtx_XYZ2RGB(pXYZ2RGB)->calc_vec(xyz));
+}
+
+cxVec cxColor::Lab(cxMtx* pRGB2XYZ) const {
+	return nxColor::XYZ_to_Lab(XYZ(pRGB2XYZ), pRGB2XYZ);
+}
+
+void cxColor::from_Lab(const cxVec& lab, cxMtx* pRGB2XYZ, cxMtx* pXYZ2RGB) {
+	from_XYZ(nxColor::Lab_to_XYZ(lab, pRGB2XYZ), pXYZ2RGB);
+}
+
+cxVec cxColor::Lch(cxMtx* pRGB2XYZ) const {
+	return nxColor::Lab_to_Lch(Lab(pRGB2XYZ));
+}
+
+void cxColor::from_Lch(const cxVec& lch, cxMtx* pRGB2XYZ, cxMtx* pXYZ2RGB) {
+	from_Lab(nxColor::Lch_to_Lab(lch), pRGB2XYZ, pXYZ2RGB);
+}
+
+uint32_t cxColor::encode_rgbe() const {
+	float m = max();
+	if (m < 1.0e-32f) return 0;
+	float t[3];
+	int e;
+	float s = (::frexpf(m, &e) * 256.0f) / m;
+	for (int i = 0; i < 3; ++i) {
+		t[i] = ch[i] * s;
+	}
+	uxVal32 res;
+	for (int i = 0; i < 3; ++i) {
+		res.b[i] = (uint8_t)t[i];
+	}
+	res.b[3] = e + 128;
+	return res.u;
+}
+
+void cxColor::decode_rgbe(uint32_t rgbe) {
+	if (rgbe) {
+		uxVal32 v;
+		v.u = rgbe;
+		int e = v.b[3];
+		float s = ::ldexpf(1.0f, e - (128 + 8));
+		float t[3];
+		for (int i = 0; i < 3; ++i) {
+			t[i] = (float)v.b[i];
+		}
+		for (int i = 0; i < 3; ++i) {
+			ch[i] = t[i] * s;
+		}
+		a = 1.0f;
+	} else {
+		zero_rgb();
+	}
+}
+
+static inline uint32_t swap_enc_clr_rb(uint32_t enc) {
+	uxVal32 v;
+	v.u = enc;
+	uint8_t t = v.b[0];
+	v.b[0] = v.b[2];
+	v.b[2] = t;
+	return v.u;
+}
+
+uint32_t cxColor::encode_bgre() const {
+	return swap_enc_clr_rb(encode_rgbe());
+}
+
+void cxColor::decode_bgre(uint32_t bgre) {
+	decode_rgbe(swap_enc_clr_rb(bgre));
+}
+
+uint32_t cxColor::encode_rgbi() const {
+	float e[4];
+	for (int i = 0; i < 3; ++i) {
+		e[i] = nxCalc::clamp(ch[i], 0.0f, 100.0f);
+	}
+	e[3] = 1.0f;
+	for (int i = 0; i < 4; ++i) {
+		e[i] = ::sqrtf(e[i]); /* gamma 2.0 encoding */
+	}
+	float m = nxCalc::max(e[0], e[1], e[2]);
+	if (m > 1.0f) {
+		float s = 1.0f / m;
+		for (int i = 0; i < 4; ++i) {
+			e[i] *= s;
+		}
+	}
+	for (int i = 0; i < 4; ++i) {
+		e[i] *= 255.0f;
+	}
+	uxVal32 res;
+	for (int i = 0; i < 4; ++i) {
+		res.b[i] = (uint8_t)e[i];
+	}
+	return res.u;
+}
+
+void cxColor::decode_rgbi(uint32_t rgbi) {
+	uxVal32 v;
+	v.u = rgbi;
+	for (int i = 0; i < 4; ++i) {
+		ch[i] = (float)v.b[i];
+	}
+	scl(nxCalc::rcp0(a));
+	for (int i = 0; i < 4; ++i) {
+		ch[i] = nxCalc::sq(ch[i]); /* gamma 2.0 decoding */
+	}
+}
+
+uint32_t cxColor::encode_bgri() const {
+	return swap_enc_clr_rb(encode_rgbi());
+}
+
+void cxColor::decode_bgri(uint32_t bgri) {
+	decode_rgbi(swap_enc_clr_rb(bgri));
+}
+
+uint32_t cxColor::encode_rgba8() const {
+	float f[4];
+	for (int i = 0; i < 4; ++i) {
+		f[i] = nxCalc::saturate(ch[i]);
+	}
+	for (int i = 0; i < 4; ++i) {
+		f[i] *= 255.0f;
+	}
+	uxVal32 v;
+	for (int i = 0; i < 4; ++i) {
+		v.b[i] = (uint8_t)f[i];
+	}
+	return v.u;
+}
+
+void cxColor::decode_rgba8(uint32_t rgba) {
+	uxVal32 v;
+	v.u = rgba;
+	for (int i = 0; i < 4; ++i) {
+		ch[i] = (float)v.b[i];
+	}
+	scl(1.0f / 255.0f);
+}
+
+uint32_t cxColor::encode_bgra8() const {
+	return swap_enc_clr_rb(encode_rgba8());
+}
+
+void cxColor::decode_bgra8(uint32_t bgra) {
+	decode_rgba8(swap_enc_clr_rb(bgra));
+}
+
+
 namespace nxSH {
 
 void calc_weights(float* pWgt, int order, float s, float scl) {
@@ -2054,6 +2928,427 @@ void calc_weights(float* pWgt, int order, float s, float scl) {
 	for (int i = 0; i < order; ++i) {
 		pWgt[i] = ::expf(float(-i*i) / (2.0f*s)) * scl;
 	}
+}
+
+void get_diff_weights(float* pWgt, int order, float scl) {
+	for (int i = 0; i < order; ++i) {
+		pWgt[i] = 0.0f;
+	}
+	if (order >= 1) pWgt[0] = scl;
+	if (order >= 2) pWgt[1] = scl / 1.5f;
+	if (order >= 3) pWgt[2] = scl / 4.0f;
+}
+
+void apply_weights(float* pDst, int order, const float* pSrc, const float* pWgt, int nelems) {
+	for (int l = 0; l < order; ++l) {
+		int i0 = calc_coefs_num(l);
+		int i1 = calc_coefs_num(l + 1);
+		float w = pWgt[l];
+		for (int i = i0; i < i1; ++i) {
+			int idx = i * nelems;
+			for (int j = 0; j < nelems; ++j) {
+				pDst[idx + j] = pSrc[idx + j] * w;
+			}
+		}
+	}
+}
+
+double calc_K(int l, int m) {
+	int am = ::abs(m);
+	double v = 1.0;
+	for (int k = l + am; k > l - am; --k) {
+		v *= k;
+	}
+	return ::sqrt((2.0*l + 1.0) / (4.0*M_PI*v));
+}
+
+double calc_Pmm(int m) {
+	double v = 1.0;
+	for (int k = 0; k <= m; ++k) {
+		v *= 1.0 - 2.0*k;
+	}
+	return v;
+}
+
+double calc_constA(int m) {
+	return calc_Pmm(m) * calc_K(m, m) * ::sqrt(2.0);
+}
+
+double calc_constB(int m) {
+	return double(2*m + 1) * calc_Pmm(m) * calc_K(m+1, m);
+}
+
+double calc_constC1(int l, int m) {
+	double c = calc_K(l, m) / calc_K(l-1, m) * double(2*l-1) / double(l-m);
+	if (l > 80) {
+		if (isnan(c)) c = 0.0;
+	}
+	return c;
+}
+
+double calc_constC2(int l, int m) {
+	double c = -calc_K(l, m) / calc_K(l-2, m) * double(l+m-1) / double(l-m);
+	if (l > 80) {
+		if (isnan(c)) c = 0.0;
+	}
+	return c;
+}
+
+double calc_constD1(int m) {
+	return double((2*m+3)*(2*m+1)) * calc_Pmm(m) / 2.0 * calc_K(m+2, m);
+}
+
+double calc_constD2(int m) {
+	return double(-(2*m + 1)) * calc_Pmm(m) / 2.0 * calc_K(m+2, m);
+}
+
+double calc_constE1(int m) {
+	return double((2*m+5)*(2*m+3)*(2*m+1)) * calc_Pmm(m) / 6.0 * calc_K(m+3,m);
+}
+
+double calc_constE2(int m) {
+	double pmm = calc_Pmm(m);
+	return (double((2*m+5)*(2*m+1))*pmm/6.0 + double((2*m+2)*(2*m+1))*pmm/3.0) * -calc_K(m+3, m);
+}
+
+template<typename CONST_T>
+void calc_consts_t(int order, CONST_T* pConsts) {
+	if (order < 1 || !pConsts) return;
+	int idx = 0;
+	pConsts[idx++] = (CONST_T)calc_K(0, 0);
+	if (order > 1) {
+		// 1, 0
+		pConsts[idx++] = (CONST_T)(calc_Pmm(0) * calc_K(1, 0));
+	}
+	if (order > 2) {
+		// 2, 0
+		pConsts[idx++] = (CONST_T)calc_constD1(0);
+		pConsts[idx++] = (CONST_T)calc_constD2(0);
+	}
+	if (order > 3) {
+		// 2, 0
+		pConsts[idx++] = (CONST_T)calc_constE1(0);
+		pConsts[idx++] = (CONST_T)calc_constE2(0);
+	}
+	for (int l = 4; l < order; ++l) {
+		pConsts[idx++] = (CONST_T)calc_constC1(l, 0);
+		pConsts[idx++] = (CONST_T)calc_constC2(l, 0);
+	}
+	const double scl = ::sqrt(2.0);
+	for (int m = 1; m < order-1; ++m) {
+		pConsts[idx++] = (CONST_T)calc_constA(m);
+		if (m + 1 < order) {
+			pConsts[idx++] = (CONST_T)(calc_constB(m) * scl);
+		}
+		if (m + 2 < order) {
+			pConsts[idx++] = (CONST_T)(calc_constD1(m) * scl);
+			pConsts[idx++] = (CONST_T)(calc_constD2(m) * scl);
+		}
+		if (m + 3 < order) {
+			pConsts[idx++] = (CONST_T)(calc_constE1(m) * scl);
+			pConsts[idx++] = (CONST_T)(calc_constE2(m) * scl);
+		}
+		for (int l = m+4; l < order; ++l) {
+			pConsts[idx++] = (CONST_T)calc_constC1(l, m);
+			pConsts[idx++] = (CONST_T)calc_constC2(l, m);
+		}
+	}
+	if (order > 1) {
+		pConsts[idx++] = (CONST_T)calc_constA(order - 1);
+	}
+}
+
+template<typename EVAL_T, typename CONST_T, int N>
+XD_FORCEINLINE
+void eval_t(int order, EVAL_T* pCoefs, const EVAL_T x[], const EVAL_T y[], const EVAL_T z[], const CONST_T* pConsts) {
+	EVAL_T zz[N];
+	for (int i = 0; i < N; ++i) {
+		zz[i] = z[i] * z[i];
+	}
+	EVAL_T cval = (EVAL_T)pConsts[0];
+	for (int i = 0; i < N; ++i) {
+		pCoefs[i] = cval;
+	}
+	int idx = 1;
+	int idst;
+	EVAL_T* pDst;
+	EVAL_T cval2;
+	if (order > 1) {
+		idst = calc_ary_idx(1, 0);
+		pDst = &pCoefs[idst * N];
+		cval = (EVAL_T)pConsts[idx++];
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = z[i] * cval;
+		}
+	}
+	if (order > 2) {
+		idst = calc_ary_idx(2, 0);
+		pDst = &pCoefs[idst * N];
+		cval = (EVAL_T)pConsts[idx++];
+		cval2 = (EVAL_T)pConsts[idx++];
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = zz[i]*cval;
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] += cval2;
+		}
+	}
+	if (order > 3) {
+		idst = calc_ary_idx(3, 0);
+		pDst = &pCoefs[idst * N];
+		cval = (EVAL_T)pConsts[idx++];
+		cval2 = (EVAL_T)pConsts[idx++];
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = zz[i]*cval;
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] += cval2;
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] *= z[i];
+		}
+	}
+	for (int l = 4; l < order; ++l) {
+		int isrc1 = calc_ary_idx(l-1, 0);
+		int isrc2 = calc_ary_idx(l-2, 0);
+		EVAL_T* pSrc1 = &pCoefs[isrc1 * N];
+		EVAL_T* pSrc2 = &pCoefs[isrc2 * N];
+		idst = calc_ary_idx(l, 0);
+		pDst = &pCoefs[idst * N];
+		cval = (EVAL_T)pConsts[idx++];
+		cval2 = (EVAL_T)pConsts[idx++];
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = z[i]*cval;
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] *= pSrc1[i];
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] += pSrc2[i] * cval2;
+		}
+	}
+	EVAL_T prev[3*N];
+	EVAL_T* pPrev;
+	EVAL_T s[2*N];
+	EVAL_T sin[N];
+	for (int i = 0; i < N; ++i) {
+		s[i] = y[i];
+	}
+	EVAL_T c[2*N];
+	EVAL_T cos[N];
+	for (int i = 0; i < N; ++i) {
+		c[i] = x[i];
+	}
+	int scIdx = 0;
+	for (int m = 1; m < order - 1; ++m) {
+		int l = m;
+		idst = l*l + l - m;
+		pDst = &pCoefs[idst * N];
+		cval = (EVAL_T)pConsts[idx++];
+		for (int i = 0; i < N; ++i) {
+			sin[i] = s[scIdx*N + i];
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = sin[i] * cval;
+		}
+		idst = l*l + l + m;
+		pDst = &pCoefs[idst * N];
+		for (int i = 0; i < N; ++i) {
+			cos[i] = c[scIdx*N + i];
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = cos[i] * cval;
+		}
+
+		if (m + 1 < order) {
+			// (m+1, -m), (m+1, m)
+			l = m + 1;
+			cval = (EVAL_T)pConsts[idx++];
+			pPrev = &prev[1*N];
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] = z[i] * cval;
+			}
+			idst = l*l + l - m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * sin[i];
+			}
+			idst = l*l + l + m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * cos[i];
+			}
+		}
+
+		if (m + 2 < order) {
+			// (m+2, -m), (m+2, m)
+			l = m + 2;
+			cval = (EVAL_T)pConsts[idx++];
+			cval2 = (EVAL_T)pConsts[idx++];
+			pPrev = &prev[2*N];
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] = zz[i]*cval + cval2;
+			}
+			idst = l*l + l - m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * sin[i];
+			}
+			idst = l*l + l + m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * cos[i];
+			}
+		}
+
+		if (m + 3 < order) {
+			// (m+3, -m), (m+3, m)
+			l = m + 3;
+			cval = (EVAL_T)pConsts[idx++];
+			cval2 = (EVAL_T)pConsts[idx++];
+			pPrev = &prev[0*N];
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] = zz[i]*cval;
+			}
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] += cval2;
+			}
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] *= z[i];
+			}
+			idst = l*l + l - m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * sin[i];
+			}
+			idst = l*l + l + m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * cos[i];
+			}
+		}
+
+		const unsigned prevMask = 1 | (0 << 2) | (2 << 4) | (1 << 6) | (0 << 8) | (2 << 10) | (1 << 12);
+		unsigned mask = prevMask | ((prevMask >> 2) << 14);
+		unsigned maskCnt = 0;
+		for (l = m + 4; l < order; ++l) {
+			unsigned prevIdx = mask & 3;
+			pPrev = &prev[prevIdx * N];
+			EVAL_T* pPrev1 = &prev[((mask >> 2) & 3) * N];
+			EVAL_T* pPrev2 = &prev[((mask >> 4) & 3) * N];
+			cval = (EVAL_T)pConsts[idx++];
+			cval2 = (EVAL_T)pConsts[idx++];
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] = z[i] * cval;
+			}
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] *= pPrev1[i];
+			}
+			for (int i = 0; i < N; ++i) {
+				pPrev[i] += pPrev2[i] * cval2;
+			}
+			idst = l*l + l - m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * sin[i];
+			}
+			idst = l*l + l + m;
+			pDst = &pCoefs[idst * N];
+			for (int i = 0; i < N; ++i) {
+				pDst[i] = pPrev[i] * cos[i];
+			}
+			if (order < 11) {
+				mask >>= 4;
+			} else {
+				++maskCnt;
+				if (maskCnt < 3) {
+					mask >>= 4;
+				} else {
+					mask = prevMask;
+					maskCnt = 0;
+				}
+			}
+		}
+
+		EVAL_T* pSinSrc = &s[scIdx * N];
+		EVAL_T* pCosSrc = &c[scIdx * N];
+		EVAL_T* pSinDst = &s[(scIdx^1) * N];
+		EVAL_T* pCosDst = &c[(scIdx^1) * N];
+		for (int i = 0; i < N; ++i) {
+			pSinDst[i] = x[i]*pSinSrc[i] + y[i]*pCosSrc[i];
+		}
+		for (int i = 0; i < N; ++i) {
+			pCosDst[i] = x[i]*pCosSrc[i] - y[i]*pSinSrc[i];
+		}
+		scIdx ^= 1;
+	}
+
+	if (order > 1) {
+		cval = (EVAL_T)pConsts[idx];
+		idst = calc_ary_idx(order - 1, -(order - 1));
+		pDst = &pCoefs[idst * N];
+		for (int i = 0; i < N; ++i) {
+			sin[i] = s[scIdx*N + i];
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = sin[i] * cval;
+		}
+		idst = calc_ary_idx(order - 1, order - 1);
+		pDst = &pCoefs[idst * N];
+		for (int i = 0; i < N; ++i) {
+			cos[i] = c[scIdx*N + i];
+		}
+		for (int i = 0; i < N; ++i) {
+			pDst[i] = cos[i] * cval;
+		}
+	}
+}
+
+void calc_consts(int order, float* pConsts) {
+	calc_consts_t(order, pConsts);
+}
+
+void calc_consts(int order, double* pConsts) {
+	calc_consts_t(order, pConsts);
+}
+
+void eval(int order, float* pCoefs, float x, float y, float z, const float* pConsts) {
+	eval_t<float, float, 1>(order, pCoefs, &x, &y, &z, pConsts);
+}
+
+void eval_ary4(int order, float* pCoefs, float x[4], float y[4], float z[4], const float* pConsts) {
+	eval_t<float, float, 4>(order, pCoefs, x, y, z, pConsts);
+}
+
+void eval_ary8(int order, float* pCoefs, float x[8], float y[8], float z[8], const float* pConsts) {
+	eval_t<float, float, 8>(order, pCoefs, x, y, z, pConsts);
+}
+
+void eval_sh3(float* pCoefs, float x, float y, float z, const float* pConsts) {
+	float tc[calc_consts_num(3)];
+	if (!pConsts) {
+		calc_consts(3, tc);
+		pConsts = tc;
+	}
+	eval_t<float, float, 1>(3, pCoefs, &x, &y, &z, pConsts);
+}
+
+void eval_sh3_ary4(float* pCoefs, float x[4], float y[4], float z[4], const float* pConsts) {
+	float tc[calc_consts_num(3)];
+	if (!pConsts) {
+		calc_consts(3, tc);
+		pConsts = tc;
+	}
+	eval_t<float, float, 4>(3, pCoefs, x, y, z, pConsts);
+}
+
+void eval_sh3_ary8(float* pCoefs, float x[8], float y[8], float z[8], const float* pConsts) {
+	float tc[calc_consts_num(3)];
+	if (!pConsts) {
+		calc_consts(3, tc);
+		pConsts = tc;
+	}
+	eval_t<float, float, 8>(3, pCoefs, x, y, z, pConsts);
 }
 
 } // nxSH
@@ -2187,7 +3482,7 @@ namespace nxData {
 
 XD_NOINLINE sxData* load(const char* pPath) {
 	size_t size = 0;
-	sxData* pData = reinterpret_cast<sxData*>(nxCore::bin_load(pPath, &size, true));
+	sxData* pData = reinterpret_cast<sxData*>(nxCore::bin_load(pPath, &size, true, true));
 	if (pData) {
 		if (pData->mFileSize == size) {
 			pData->mFilePathLen = (uint32_t)::strlen(pPath);
@@ -2203,17 +3498,397 @@ XD_NOINLINE void unload(sxData* pData) {
 	nxCore::bin_unload(pData);
 }
 
+static int pk_find_dict_idx(const uint32_t* pCnts, int n, uint32_t cnt) {
+	const uint32_t* p = pCnts;
+	uint32_t c = (uint32_t)n;
+	while (c > 1) {
+		uint32_t mid = c / 2;
+		const uint32_t* pm = &p[mid];
+		uint32_t ck = *pm;
+		p = (cnt > ck) ? p : pm;
+		c -= mid;
+	}
+	return (int)(p - pCnts) + ((p != pCnts) & (*p < cnt));
+}
+
+static uint8_t pk_get_bit_cnt(uint8_t x) {
+	for (uint8_t i = 8; --i > 0;) {
+		if (x & (1 << i)) return i + 1;
+	}
+	return 1;
+}
+
+static uint32_t pk_bit_cnt_to_bytes(uint32_t n) {
+	return (n >> 3) + ((n & 7) != 0);
+}
+
+static uint32_t pk_mk_dict(uint8_t* pDict, uint8_t* pXlat, const uint8_t* pSrc, uint32_t srcSize) {
+	uint32_t cnt[0x100];
+	::memset(cnt, 0, sizeof(cnt));
+	for (uint32_t i = 0; i < srcSize; ++i) {
+		++cnt[pSrc[i]];
+	}
+	uint8_t idx[0x100];
+	uint32_t idict = 0;
+	for (uint32_t i = 0; i < 0x100; ++i) {
+		if (cnt[i]) {
+			idx[idict] = i;
+			++idict;
+		}
+	}
+	::memset(pDict, 0, 0x100);
+	uint32_t dictSize = idict;
+	uint32_t dictCnt[0x100];
+	for (uint32_t i = 0; i < dictSize; ++i) {
+		uint8_t id = idx[i];
+		uint32_t c = cnt[id];
+		if (i == 0) {
+			pDict[i] = id;
+			dictCnt[i] = c;
+		} else {
+			int idx = pk_find_dict_idx(dictCnt, i, c);
+			if (idx == i - 1) {
+				if (c > dictCnt[idx]) {
+					pDict[i] = pDict[i - 1];
+					dictCnt[i] = dictCnt[i - 1];
+					pDict[i - 1] = id;
+					dictCnt[i - 1] = c;
+				} else {
+					pDict[i] = id;
+					dictCnt[i] = c;
+				}
+			} else {
+				if (c > dictCnt[idx]) --idx;
+				for (int j = i; --j >= idx + 1;) {
+					pDict[j + 1] = pDict[j];
+					dictCnt[j + 1] = dictCnt[j];
+				}
+				pDict[idx + 1] = id;
+				dictCnt[idx + 1] = c;
+			}
+		}
+	}
+	::memset(pXlat, 0, 0x100);
+	for (uint32_t i = 0; i < dictSize; ++i) {
+		pXlat[pDict[i]] = i;
+	}
+	return dictSize;
+}
+
+static uint32_t pk_encode(uint8_t* pBitCnt, uint8_t* pBitCode, const uint8_t* pXlat, const uint8_t* pSrc, uint32_t srcSize) {
+	uint32_t bitDst = 0;
+	for (uint32_t i = 0; i < srcSize; ++i) {
+		uint8_t code = pXlat[pSrc[i]];
+		uint8_t nbits = pk_get_bit_cnt(code);
+		uint8_t bitCode = nbits - 1;
+		uint32_t cntIdx = i * 3;
+		uint32_t byteIdx = cntIdx >> 3;
+		uint32_t bitIdx = cntIdx & 7;
+		pBitCnt[byteIdx] |= bitCode << bitIdx;
+		pBitCnt[byteIdx + 1] |= bitCode >> (8 - bitIdx);
+
+		uint8_t dstBits = nbits;
+		if (nbits > 1) {
+			code -= 1 << (nbits - 1);
+			--dstBits;
+		}
+
+		byteIdx = bitDst >> 3;
+		bitIdx = bitDst & 7;
+		pBitCode[byteIdx] |= code << bitIdx;
+		pBitCode[byteIdx + 1] |= code >> (8 - bitIdx);
+		bitDst += dstBits;
+	}
+	return bitDst;
+}
+
+struct sxPkdWork {
+	uint8_t mDict[0x100];
+	uint8_t mXlat[0x100];
+	uint32_t mSrcSize;
+	uint32_t mDictSize;
+	uint32_t mBitCntBytes;
+	uint8_t* mpBitCnt;
+	uint8_t* mpBitCode;
+	uint32_t mBitCodeBits;
+	uint32_t mBitCodeBytes;
+
+	sxPkdWork() : mpBitCnt(nullptr), mpBitCode(nullptr) {}
+	~sxPkdWork() { reset(); }
+
+	void reset() {
+		if (mpBitCnt) {
+			nxCore::mem_free(mpBitCnt);
+			mpBitCnt = nullptr;
+		}
+		if (mpBitCode) {
+			nxCore::mem_free(mpBitCode);
+			mpBitCode = nullptr;
+		}
+	}
+
+	bool is_valid() const { return (mpBitCnt && mpBitCode); }
+
+	bool encode(const uint8_t* pSrc, uint32_t srcSize) {
+		bool res = false;
+		mSrcSize = srcSize;
+		mDictSize = pk_mk_dict(mDict, mXlat, pSrc, srcSize);
+		mBitCntBytes = pk_bit_cnt_to_bytes(srcSize * 3);
+		mpBitCnt = (uint8_t*)nxCore::mem_alloc(mBitCntBytes);
+		if (mpBitCnt) {
+			::memset(mpBitCnt, 0, mBitCntBytes);
+			mpBitCode = (uint8_t*)nxCore::mem_alloc(srcSize);
+			if (mpBitCode) {
+				::memset(mpBitCode, 0, srcSize);
+				mBitCodeBits = pk_encode(mpBitCnt, mpBitCode, mXlat, pSrc, srcSize);
+				mBitCodeBytes = pk_bit_cnt_to_bytes(mBitCodeBits);
+				res = true;
+			} else {
+				nxCore::mem_free(mpBitCnt);
+				mpBitCnt = nullptr;
+			}
+		}
+		return res;
+	}
+
+	uint32_t get_pkd_size() const {
+		return is_valid() ? sizeof(sxPackedData) + mDictSize + mBitCntBytes + mBitCodeBytes : 0;
+	}
+};
+
+static sxPackedData* pkd0(const sxPkdWork& wk) {
+	sxPackedData* pPkd = nullptr;
+	if (wk.is_valid()) {
+		uint32_t size = wk.get_pkd_size();
+		pPkd = (sxPackedData*)nxCore::mem_alloc(size, sxPackedData::SIG);
+		if (pPkd) {
+			pPkd->mSig = sxPackedData::SIG;
+			pPkd->mAttr = 0 | ((wk.mDictSize - 1) << 8);
+			pPkd->mPackSize = size;
+			pPkd->mRawSize = wk.mSrcSize;
+			uint8_t* pDict = (uint8_t*)(pPkd + 1);
+			uint8_t* pCnt = pDict + wk.mDictSize;
+			uint8_t* pCode = pCnt + wk.mBitCntBytes;
+			::memcpy(pDict, wk.mDict, wk.mDictSize);
+			::memcpy(pCnt, wk.mpBitCnt, wk.mBitCntBytes);
+			::memcpy(pCode, wk.mpBitCode, wk.mBitCodeBytes);
+		}
+	}
+	return pPkd;
+}
+
+static sxPackedData* pkd1(const sxPkdWork& wk, const sxPkdWork& wk2) {
+	sxPackedData* pPkd = nullptr;
+	if (wk.is_valid() && wk2.is_valid()) {
+		uint32_t size = sizeof(sxPackedData) + 4 + wk.mDictSize + wk2.mDictSize + wk2.mBitCntBytes + wk2.mBitCodeBytes + wk.mBitCodeBytes;
+		pPkd = (sxPackedData*)nxCore::mem_alloc(size, sxPackedData::SIG);
+		if (pPkd) {
+			pPkd->mSig = sxPackedData::SIG;
+			pPkd->mAttr = 1 | ((wk.mDictSize - 1) << 8) | ((wk2.mDictSize - 1) << 16);
+			pPkd->mPackSize = size;
+			pPkd->mRawSize = wk.mSrcSize;
+			uint32_t* pCntSize = (uint32_t*)(pPkd + 1);
+			uint8_t* pDict = (uint8_t*)(pPkd + 1) + 4;
+			uint8_t* pDict2 = pDict + wk.mDictSize;
+			uint8_t* pCnt2 = pDict2 + wk2.mDictSize;
+			uint8_t* pCode2 = pCnt2 + wk2.mBitCntBytes;
+			uint8_t* pCode = pCode2 + wk2.mBitCodeBytes;
+			*pCntSize = wk2.mBitCodeBytes;
+			::memcpy(pDict, wk.mDict, wk.mDictSize);
+			::memcpy(pDict2, wk2.mDict, wk2.mDictSize);
+			::memcpy(pCnt2, wk2.mpBitCnt, wk2.mBitCntBytes);
+			::memcpy(pCode2, wk2.mpBitCode, wk2.mBitCodeBytes);
+			::memcpy(pCode, wk.mpBitCode, wk.mBitCodeBytes);
+		}
+	}
+	return pPkd;
+}
+
+sxPackedData* pack(const uint8_t* pSrc, uint32_t srcSize, uint32_t mode) {
+	sxPackedData* pPkd = nullptr;
+	if (pSrc && srcSize > 0x10 && mode < 2) {
+		sxPkdWork wk;
+		wk.encode(pSrc, srcSize);
+		uint32_t pkdSize = wk.get_pkd_size();
+		if (pkdSize && pkdSize < srcSize) {
+			if (mode == 1) {
+				sxPkdWork wk2;
+				wk2.encode(wk.mpBitCnt, wk.mBitCntBytes);
+				uint32_t pkdSize2 = wk2.is_valid() ? wk2.get_pkd_size() + 4 + wk.mDictSize + wk.mBitCodeBytes : 0;
+				if (pkdSize2 && pkdSize2 < pkdSize) {
+					pPkd = pkd1(wk, wk2);
+				} else {
+					wk2.reset();
+					pPkd = pkd0(wk);
+				}
+			} else {
+				pPkd = pkd0(wk);
+			}
+		}
+	}
+	return pPkd;
+}
+
+static void pk_decode(uint8_t* pDst, uint32_t size, uint8_t* pDict, uint8_t* pBitCnt, uint8_t* pBitCodes) {
+	uint32_t codeBitIdx = 0;
+	for (uint32_t i = 0; i < size; ++i) {
+		uint32_t cntBitIdx = i * 3;
+		uint32_t byteIdx = cntBitIdx >> 3;
+		uint32_t bitIdx = cntBitIdx & 7;
+		uint8_t nbits = pBitCnt[byteIdx] >> bitIdx;
+		nbits |= pBitCnt[byteIdx + 1] << (8 - bitIdx);
+		nbits &= 7;
+		nbits += 1;
+
+		uint8_t codeBits = nbits;
+		if (nbits > 1) {
+			--codeBits;
+		}
+		byteIdx = codeBitIdx >> 3;
+		bitIdx = codeBitIdx & 7;
+		uint8_t code = pBitCodes[byteIdx] >> bitIdx;
+		code |= pBitCodes[byteIdx + 1] << (8 - bitIdx);
+		code &= (uint8_t)(((uint32_t)1 << codeBits) - 1);
+		codeBitIdx += codeBits;
+		if (nbits > 1) {
+			code += 1 << (nbits - 1);
+		}
+		pDst[i] = pDict[code];
+	}
+}
+
+uint8_t* unpack(sxPackedData* pPkd, uint32_t memTag, uint8_t* pDstMem, uint32_t dstMemSize) {
+	uint8_t* pDst = nullptr;
+	if (pPkd && pPkd->mSig == sxPackedData::SIG) {
+		if (pDstMem && dstMemSize >= pPkd->mRawSize) {
+			pDst = pDstMem;
+		} else {
+			pDst = (uint8_t*)nxCore::mem_alloc(pPkd->mRawSize, memTag);
+		}
+		if (pDst) {
+			int mode = pPkd->get_mode();
+			if (mode == 0) {
+				uint32_t dictSize = ((pPkd->mAttr >> 8) & 0xFF) + 1;
+				uint8_t* pDict = (uint8_t*)(pPkd + 1);
+				uint8_t* pBitCnt = pDict + dictSize;
+				uint8_t* pBitCodes = pBitCnt + pk_bit_cnt_to_bytes(pPkd->mRawSize * 3);
+				pk_decode(pDst, pPkd->mRawSize, pDict, pBitCnt, pBitCodes);
+			} else if (mode == 1) {
+				uint32_t dictSize = ((pPkd->mAttr >> 8) & 0xFF) + 1;
+				uint32_t dictSize2 = ((pPkd->mAttr >> 16) & 0xFF) + 1;
+				uint32_t* pCode2Size = (uint32_t*)(pPkd + 1);
+				uint8_t* pDict = (uint8_t*)(pCode2Size + 1);
+				uint8_t* pDict2 = pDict + dictSize;
+				uint8_t* pCnt2 = pDict2 + dictSize2;
+				uint32_t cntSize = pk_bit_cnt_to_bytes(pPkd->mRawSize * 3);
+				uint8_t* pCode2 = pCnt2 + pk_bit_cnt_to_bytes(cntSize * 3);
+				uint8_t* pCode = pCode2 + *pCode2Size;
+				uint8_t* pCnt = (uint8_t*)nxCore::mem_alloc(cntSize);
+				if (pCnt) {
+					pk_decode(pCnt, cntSize, pDict2, pCnt2, pCode2);
+					pk_decode(pDst, pPkd->mRawSize, pDict, pCnt, pCode);
+					nxCore::mem_free(pCnt);
+				} else {
+					if (pDst != pDstMem) {
+						nxCore::mem_free(pDst);
+					}
+					pDst = nullptr;
+				}
+			}
+		}
+	}
+	return pDst;
+}
+
 } // nxData
 
+
+static int find_str_hash_idx(const uint16_t* pHash, int n, uint16_t h) {
+	const uint16_t* p = pHash;
+	uint32_t cnt = (uint32_t)n;
+	while (cnt > 1) {
+		uint32_t mid = cnt / 2;
+		const uint16_t* pm = &p[mid];
+		uint16_t ck = *pm;
+		p = (h < ck) ? p : pm;
+		cnt -= mid;
+	}
+	return (int)(p - pHash) + ((p != pHash) & (*p > h));
+}
+
+bool sxStrList::is_sorted() const {
+	uint8_t flags = ((uint8_t*)this + mSize)[-1];
+	return (flags != 0) && ((flags & 1) != 0);
+}
 
 XD_NOINLINE int sxStrList::find_str(const char* pStr) const {
 	if (!pStr) return -1;
 	uint16_t h = nxCore::str_hash16(pStr);
 	uint16_t* pHash = get_hash_top();
+	if (is_sorted()) {
+		int idx = find_str_hash_idx(pHash, mNum, h);
+		if (h == pHash[idx]) {
+			int nck = 1;
+			for (int i = idx; --i >= 0;) {
+				if (pHash[i] != h) break;
+				--idx;
+				++nck;
+			}
+			for (int i = 0; i < nck; ++i) {
+				int strIdx = idx + i;
+				if (nxCore::str_eq(get_str(strIdx), pStr)) {
+					return strIdx;
+				}
+			}
+		}
+	} else {
+		for (uint32_t i = 0; i < mNum; ++i) {
+			if (h == pHash[i]) {
+				if (nxCore::str_eq(get_str(i), pStr)) {
+					return i;
+				}
+			}
+		}
+	}
+	return -1;
+}
+
+XD_NOINLINE int sxStrList::find_str_any(const char** ppStrs, int n) const {
+	if (!ppStrs || n < 1) return -1;
+	int org;
+	uint16_t hblk[8];
+	int bsize = XD_ARY_LEN(hblk);
+	int nblk = n / bsize;
+	uint16_t* pHash = get_hash_top();
+	for (int iblk = 0; iblk < nblk; ++iblk) {
+		org = iblk * bsize;
+		for (int j = 0; j < bsize; ++j) {
+			hblk[j] = nxCore::str_hash16(ppStrs[org + j]);
+		}
+		for (uint32_t i = 0; i < mNum; ++i) {
+			uint16_t htst = pHash[i];
+			const char* pStr = get_str(i);
+			for (int j = 0; j < bsize; ++j) {
+				if (htst == hblk[j]) {
+					if (nxCore::str_eq(pStr, ppStrs[org + j])) {
+						return i;
+					}
+				}
+			}
+		}
+	}
+	org = nblk * bsize;
+	for (int j = org; j < n; ++j) {
+		hblk[j - org] = nxCore::str_hash16(ppStrs[j]);
+	}
 	for (uint32_t i = 0; i < mNum; ++i) {
-		if (h == pHash[i]) {
-			if (nxCore::str_eq(get_str(i), pStr)) {
-				return i;
+		uint16_t htst = pHash[i];
+		const char* pStr = get_str(i);
+		for (int j = org; j < n; ++j) {
+			if (htst == hblk[j - org]) {
+				if (nxCore::str_eq(pStr, ppStrs[j])) {
+					return i;
+				}
 			}
 		}
 	}
@@ -2275,6 +3950,24 @@ int sxValuesData::Group::find_val_idx(const char* pName) const {
 						idx = i;
 						break;
 					}
+				}
+			}
+		}
+	}
+	return idx;
+}
+
+int sxValuesData::Group::find_val_idx_any(const char** ppNames, int n) const {
+	int idx = -1;
+	if (ppNames && n > 0 && is_valid()) {
+		sxStrList* pStrLst = mpVals->get_str_list();
+		if (pStrLst) {
+			for (int i = 0; i < n; ++i) {
+				const char* pName = ppNames[i];
+				int tst = find_val_idx(pName);
+				if (ck_val_idx(tst)) {
+					idx = tst;
+					break;
 				}
 			}
 		}
@@ -2420,6 +4113,15 @@ float sxValuesData::Group::get_float(const char* pName, const float defVal) cons
 	return f;
 }
 
+float sxValuesData::Group::get_float_any(const char** ppNames, int n, const float defVal) const {
+	float f = defVal;
+	int idx = find_val_idx_any(ppNames, n);
+	if (idx >= 0) {
+		f = get_val_f(idx);
+	}
+	return f;
+}
+
 int sxValuesData::Group::get_int(const char* pName, const int defVal) const {
 	int i = defVal;
 	int idx = find_val_idx(pName);
@@ -2429,9 +4131,28 @@ int sxValuesData::Group::get_int(const char* pName, const int defVal) const {
 	return i;
 }
 
+int sxValuesData::Group::get_int_any(const char** ppNames, int n, const int defVal) const {
+	int i = defVal;
+	int idx = find_val_idx_any(ppNames, n);
+	if (idx >= 0) {
+		i = get_val_i(idx);
+	}
+	return i;
+}
+
 cxVec sxValuesData::Group::get_vec(const char* pName, const cxVec& defVal) const {
 	cxVec v = defVal;
 	int idx = find_val_idx(pName);
+	if (idx >= 0) {
+		xt_float3 f3 = get_val_f3(idx);
+		v.set(f3.x, f3.y, f3.z);
+	}
+	return v;
+}
+
+cxVec sxValuesData::Group::get_vec_any(const char** ppNames, int n, const cxVec& defVal) const {
+	cxVec v = defVal;
+	int idx = find_val_idx_any(ppNames, n);
 	if (idx >= 0) {
 		xt_float3 f3 = get_val_f3(idx);
 		v.set(f3.x, f3.y, f3.z);
@@ -2449,9 +4170,28 @@ cxColor sxValuesData::Group::get_rgb(const char* pName, const cxColor& defVal) c
 	return c;
 }
 
+cxColor sxValuesData::Group::get_rgb_any(const char** ppNames, int n, const cxColor& defVal) const {
+	cxColor c = defVal;
+	int idx = find_val_idx_any(ppNames, n);
+	if (idx >= 0) {
+		xt_float3 f3 = get_val_f3(idx);
+		c.set(f3.x, f3.y, f3.z);
+	}
+	return c;
+}
+
 const char* sxValuesData::Group::get_str(const char* pName, const char* pDefVal) const {
 	const char* pStr = pDefVal;
 	int idx = find_val_idx(pName);
+	if (idx >= 0) {
+		pStr = get_val_s(idx);
+	}
+	return pStr;
+}
+
+const char* sxValuesData::Group::get_str_any(const char** ppNames, int n, const char* pDefVal) const {
+	const char* pStr = pDefVal;
+	int idx = find_val_idx_any(ppNames, n);
 	if (idx >= 0) {
 		pStr = get_val_s(idx);
 	}
@@ -2752,7 +4492,9 @@ cxMtx sxRigData::calc_wmtx(int idx, const cxMtx* pMtxLocal, cxMtx* pParentWMtx) 
 			parentMtx.mul(pMtxLocal[pNode->mSelfIdx]);
 			pNode = get_node_ptr(pNode->mParentIdx);
 		}
-		parentMtx.mul(pMtxLocal[pNode->mSelfIdx]);
+		if (pNode) {
+			parentMtx.mul(pMtxLocal[pNode->mSelfIdx]);
+		}
 		mtx.mul(parentMtx);
 	}
 	if (pParentWMtx) {
@@ -2761,8 +4503,108 @@ cxMtx sxRigData::calc_wmtx(int idx, const cxMtx* pMtxLocal, cxMtx* pParentWMtx) 
 	return mtx;
 }
 
-void sxRigData::calc_ik_chain(IKChain& chain) {
-	if (!chain.mpMtxL) return;
+void sxRigData::LimbChain::set(LimbInfo* pInfo) {
+	if (pInfo) {
+		mTopCtrl = pInfo->mTopCtrl;
+		mEndCtrl = pInfo->mEndCtrl;
+		mExtCtrl = pInfo->mExtCtrl;
+		mTop = pInfo->mTop;
+		mRot = pInfo->mRot;
+		mEnd = pInfo->mEnd;
+		mExt = pInfo->mExt;
+		mAxis = (exAxis)pInfo->mAxis;
+		mUp = (exAxis)pInfo->mUp;
+		mExtCompensate = pInfo->get_ext_comp_flg();
+	} else {
+		mTopCtrl = -1;
+		mEndCtrl = -1;
+		mExtCtrl = -1;
+		mTop = -1;
+		mRot = -1;
+		mEnd = -1;
+		mExt = -1;
+		mAxis = exAxis::MINUS_Y;
+		mUp = exAxis::PLUS_Z;
+		mExtCompensate = false;
+	}
+}
+
+static xt_float2 ik_cos_law(float a, float b, float c) {
+	xt_float2 ang;
+	if (c < a + b) {
+		float aa = nxCalc::sq(a);
+		float bb = nxCalc::sq(b);
+		float cc = nxCalc::sq(c);
+		float c0 = (aa - bb + cc) / (2.0f*a*c);
+		float c1 = (aa + bb - cc) / (2.0f*a*b);
+		c0 = nxCalc::clamp(c0, -1.0f, 1.0f);
+		c1 = nxCalc::clamp(c1, -1.0f, 1.0f);
+		ang[0] = -::acosf(c0);
+		ang[1] = XD_PI - ::acosf(c1);
+	} else {
+		ang.fill(0.0f);
+	}
+	return ang;
+}
+
+struct sxLimbIKWork {
+	cxMtx mRootW;
+	cxMtx mParentW;
+	cxMtx mTopW;
+	cxMtx mRotW;
+	cxMtx mEndW;
+	cxMtx mExtW;
+	cxMtx mTopL;
+	cxMtx mRotL;
+	cxMtx mEndL;
+	cxMtx mExtL;
+	cxVec mRotOffs;
+	const sxRigData* mpRig;
+	const sxRigData::LimbChain* mpChain;
+	float mDistTopRot;
+	float mDistRotEnd;
+	float mDistTopEnd;
+	exAxis mAxis;
+	exAxis mUp;
+
+	void calc_world();
+	void calc_local(bool fixPos = true);
+};
+
+void sxLimbIKWork::calc_world() {
+	xt_float2 ang = ik_cos_law(mDistTopRot, mDistRotEnd, mDistTopEnd);
+	cxVec axis = nxVec::get_axis(mAxis);
+	cxVec up = nxVec::get_axis(mUp);
+	cxMtx mtxZY = nxMtx::orient_zy(axis, up, false);
+	cxVec side = mtxZY.calc_vec(nxVec::get_axis(exAxis::PLUS_X));
+	cxVec axisX = mTopW.calc_vec(side);
+	cxVec axisZ = (mEndW.get_translation() - mTopW.get_translation()).get_normalized();
+	cxMtx mtxZX = nxMtx::orient_zx(axisZ, axisX, false);
+	cxMtx mtxIK = mtxZY.get_transposed() * mtxZX;
+	cxMtx rotMtx = nxMtx::from_axis_angle(side, ang[0]);
+	cxVec topPos = mTopW.get_translation();
+	mTopW = rotMtx * mtxIK;
+	mTopW.set_translation(topPos);
+	cxVec rotPos = mTopW.calc_pnt(mRotOffs);
+	rotMtx = nxMtx::from_axis_angle(side, ang[1]);
+	mRotW = rotMtx * mTopW;
+	mRotW.set_translation(rotPos);
+}
+
+void sxLimbIKWork::calc_local(bool fixPos) {
+	mTopL = mTopW * mParentW.get_inverted();
+	mRotL = mRotW * mTopW.get_inverted();
+	mEndL = mEndW * mRotW.get_inverted();
+	if (fixPos && mpChain) {
+		mTopL.set_translation(mpRig->get_lpos(mpChain->mTop));
+		mRotL.set_translation(mpRig->get_lpos(mpChain->mRot));
+		mEndL.set_translation(mpRig->get_lpos(mpChain->mEnd));
+	}
+}
+
+void sxRigData::calc_limb_local(LimbChain::Solution* pSolution, const LimbChain& chain, cxMtx* pMtx, LimbChain::AdjustFunc* pAdjFunc) const {
+	if (!pMtx) return;
+	if (!pSolution) return;
 	if (!ck_node_idx(chain.mTopCtrl)) return;
 	if (!ck_node_idx(chain.mEndCtrl)) return;
 	if (!ck_node_idx(chain.mTop)) return;
@@ -2771,23 +4613,77 @@ void sxRigData::calc_ik_chain(IKChain& chain) {
 	int parentIdx = get_parent_idx(chain.mTopCtrl);
 	if (!ck_node_idx(parentIdx)) return;
 	bool isExt = ck_node_idx(chain.mExtCtrl);
-	int rootIdx = isExt ? get_parent_idx(chain.mExtCtrl) : get_parent_idx(chain.mEndCtrl);
+	int rootIdx = rootIdx = isExt ? get_parent_idx(chain.mExtCtrl) : get_parent_idx(chain.mEndCtrl);
 	if (!ck_node_idx(rootIdx)) return;
 
-	cxMtx parentW;
-	cxMtx topW;
-	if (chain.mpMtxW) {
-		topW = chain.mpMtxW[chain.mTopCtrl];
-		parentW = chain.mpMtxW[parentIdx];
+	sxLimbIKWork ik;
+	ik.mpRig = this;
+	ik.mpChain = &chain;
+	ik.mTopW = calc_wmtx(chain.mTopCtrl, pMtx, &ik.mParentW);
+	ik.mRootW = calc_wmtx(rootIdx, pMtx);
+	if (isExt) {
+		ik.mExtW = pMtx[chain.mExtCtrl] * ik.mRootW;
+		ik.mEndW = pMtx[chain.mExtCtrl] * pMtx[chain.mEndCtrl].get_sr() * ik.mRootW;
 	} else {
-		topW = calc_wmtx(chain.mTopCtrl, chain.mpMtxL, &parentW);
+		ik.mExtW.identity();
+		ik.mEndW = pMtx[chain.mEndCtrl] * ik.mRootW;
 	}
 
-	cxMtx rootW;
-	if (chain.mpMtxW) {
-		rootW = chain.mpMtxW[rootIdx];
+	cxVec effPos = isExt ? ik.mExtW.get_translation() : ik.mEndW.get_translation();
+	if (pAdjFunc) {
+		effPos = (*pAdjFunc)(*this, chain, effPos);
+	}
+
+	cxVec endPos;
+	if (isExt) {
+		ik.mExtW.set_translation(effPos);
+		cxVec extOffs = ck_node_idx(chain.mExt) ? get_lpos(chain.mExt).neg_val() : get_lpos(chain.mExtCtrl);
+		extOffs = pMtx[chain.mExtCtrl].calc_vec(extOffs);
+		endPos = (pMtx[chain.mEndCtrl] * ik.mRootW).calc_vec(extOffs) + ik.mExtW.get_translation();
 	} else {
-		rootW = calc_wmtx(rootIdx, chain.mpMtxL);
+		endPos = effPos;
+	}
+	ik.mEndW.set_translation(endPos);
+
+	ik.mRotOffs = get_lpos(chain.mRot);
+	ik.mDistTopRot = calc_parent_dist(chain.mRot);
+	ik.mDistRotEnd = calc_parent_dist(chain.mEnd);
+	ik.mDistTopEnd = nxVec::dist(endPos, ik.mTopW.get_translation());
+	ik.mAxis = chain.mAxis;
+	ik.mUp = chain.mUp;
+	ik.calc_world();
+	ik.calc_local();
+
+	if (isExt) {
+		if (chain.mExtCompensate) {
+			ik.mExtL = ik.mExtW * ik.mEndW.get_inverted();
+		} else {
+			ik.mExtL = pMtx[chain.mExtCtrl] * ik.mRootW * ik.mEndW.get_inverted();
+		}
+		ik.mExtL.set_translation(get_lpos(chain.mExt));
+	} else {
+		ik.mExtL.identity();
+	}
+
+	pSolution->mTop = ik.mTopL;
+	pSolution->mRot = ik.mRotL;
+	pSolution->mEnd = ik.mEndL;
+	pSolution->mExt = ik.mExtL;
+}
+
+void sxRigData::copy_limb_solution(cxMtx* pDstMtx, const LimbChain& chain, const LimbChain::Solution& solution) {
+	if (!pDstMtx) return;
+	if (ck_node_idx(chain.mTop)) {
+		pDstMtx[chain.mTop] = solution.mTop;
+	}
+	if (ck_node_idx(chain.mRot)) {
+		pDstMtx[chain.mRot] = solution.mRot;
+	}
+	if (ck_node_idx(chain.mEnd)) {
+		pDstMtx[chain.mEnd] = solution.mEnd;
+	}
+	if (ck_node_idx(chain.mExt)) {
+		pDstMtx[chain.mExt] = solution.mExt;
 	}
 }
 
@@ -2803,6 +4699,84 @@ bool sxRigData::has_info_list() const {
 		}
 	}
 	return res;
+}
+
+sxRigData::Info* sxRigData::find_info(eInfoKind kind) const {
+	Info* pInfo = nullptr;
+	if (has_info_list()) {
+		Info* pList = reinterpret_cast<Info*>(XD_INCR_PTR(this, mOffsInfo));
+		Info* pEntry = reinterpret_cast<Info*>(XD_INCR_PTR(this, pList->mOffs));
+		int n = pList->mNum;
+		for (int i = 0; i < n; ++i) {
+			if (pEntry->get_kind() == kind) {
+				pInfo = pEntry;
+				break;
+			}
+			++pEntry;
+		}
+	}
+	return pInfo;
+}
+
+sxRigData::LimbInfo* sxRigData::find_limb(sxRigData::eLimbType type, int idx) const {
+	sxRigData::LimbInfo* pLimb = nullptr;
+	Info* pInfo = find_info(eInfoKind::LIMBS);
+	if (pInfo && pInfo->mOffs) {
+		int n = pInfo->mNum;
+		LimbInfo* pCk = (LimbInfo*)XD_INCR_PTR(this, pInfo->mOffs);
+		for (int i = 0; i < n; ++i) {
+			if (pCk[i].get_type() == type && pCk[i].get_idx() == idx) {
+				pLimb = &pCk[i];
+				break;
+			}
+		}
+	}
+	return pLimb;
+}
+
+int sxRigData::get_expr_num() const {
+	int n = 0;
+	Info* pInfo = find_info(eInfoKind::EXPRS);
+	if (pInfo) {
+		n = pInfo->mNum;
+	}
+	return n;
+}
+
+int sxRigData::get_expr_stack_size() const {
+	int stksize = 0;
+	Info* pInfo = find_info(eInfoKind::EXPRS);
+	if (pInfo) {
+		stksize = (int)(pInfo->mParam & 0xFF);
+		if (0 == stksize) {
+			stksize = 16;
+		}
+	}
+	return stksize;
+}
+
+sxRigData::ExprInfo* sxRigData::get_expr_info(int idx) const {
+	ExprInfo* pExprInfo = nullptr;
+	Info* pInfo = find_info(eInfoKind::EXPRS);
+	if (pInfo && pInfo->mOffs) {
+		if ((uint32_t)idx < pInfo->mNum) {
+			uint32_t* pOffs = reinterpret_cast<uint32_t*>(XD_INCR_PTR(this, pInfo->mOffs));
+			uint32_t offs = pOffs[idx];
+			if (offs) {
+				pExprInfo = reinterpret_cast<sxRigData::ExprInfo*>(XD_INCR_PTR(this, offs));
+			}
+		}
+	}
+	return pExprInfo;
+}
+
+sxCompiledExpression* sxRigData::get_expr_code(int idx) const {
+	sxCompiledExpression* pCode = nullptr;
+	ExprInfo* pExprInfo = get_expr_info(idx);
+	if (pExprInfo) {
+		pCode = pExprInfo->get_code();
+	}
+	return pCode;
 }
 
 
@@ -2950,6 +4924,20 @@ sxGeometryData::AttrInfo* sxGeometryData::get_attr_info(int attrIdx, eAttrClass 
 		pAttr = &reinterpret_cast<AttrInfo*>(XD_INCR_PTR(this, offs))[attrIdx];
 	}
 	return pAttr;
+}
+
+const char* sxGeometryData::get_attr_val_s(int attrIdx, eAttrClass cls, int itemIdx) const {
+	const char* pStr = nullptr;
+	uint32_t itemNum = get_attr_item_num(cls);
+	if ((uint32_t)itemIdx < itemNum) {
+		AttrInfo* pInfo = get_attr_info(attrIdx, cls);
+		if (pInfo && pInfo->is_string()) {
+			uint32_t* pTop = reinterpret_cast<uint32_t*>(XD_INCR_PTR(this, pInfo->mDataOffs));
+			int strId = pTop[itemIdx*pInfo->mElemNum];
+			pStr = get_str(strId);
+		}
+	}
+	return pStr;
 }
 
 float* sxGeometryData::get_attr_data_f(int attrIdx, eAttrClass cls, int itemIdx, int minElem) const {
@@ -3106,8 +5094,8 @@ int sxGeometryData::get_pnt_skin_jnt(int pntIdx, int wgtIdx) const {
 			if (nnodes <= (1 << 8)) {
 				idx = pIdx[wgtIdx];
 			} else {
-				idx = pIdx[wgtIdx * 2];
-				idx |= pIdx[wgtIdx * 2 + 1] << 8;
+				idx = pIdx[wgtIdx*2];
+				idx |= pIdx[wgtIdx*2 + 1] << 8;
 			}
 		}
 	}
@@ -3187,6 +5175,24 @@ sxGeometryData::Group sxGeometryData::get_mtl_grp(int idx) const {
 		grp.mpInfo = nullptr;
 	}
 	return grp;
+}
+
+const char* sxGeometryData::get_mtl_name(int idx) const {
+	const char* pName = nullptr;
+	GrpInfo* pInfo = get_mtl_info(idx);
+	if (pInfo) {
+		pName = get_str(pInfo->mNameId);
+	}
+	return pName;
+}
+
+const char* sxGeometryData::get_mtl_path(int idx) const {
+	const char* pPath = nullptr;
+	GrpInfo* pInfo = get_mtl_info(idx);
+	if (pInfo) {
+		pPath = get_str(pInfo->mPathId);
+	}
+	return pPath;
 }
 
 sxGeometryData::GrpInfo* sxGeometryData::get_pnt_grp_info(int idx) const {
@@ -3376,6 +5382,66 @@ cxAABB sxGeometryData::calc_world_bbox(cxMtx* pMtxW, int* pIdxMap) const {
 		}
 	}
 	return bbox;
+}
+
+void sxGeometryData::calc_tangents(cxVec* pTng, bool flip, const char* pAttrName) const {
+	if (!pTng) return;
+	int npnt = get_pnt_num();
+	::memset(pTng, 0, npnt * sizeof(cxVec));
+	if (!is_all_tris()) return;
+	int nrmAttrIdx = find_pnt_attr("N");
+	if (nrmAttrIdx < 0) return;
+	int texAttrIdx = find_pnt_attr(pAttrName ? pAttrName : "uv");
+	if (texAttrIdx < 0) return;
+	int ntri = get_pol_num();
+	cxVec triPts[3];
+	xt_texcoord triUVs[3];
+	for (int i = 0; i < ntri; ++i) {
+		Polygon tri = get_pol(i);
+		for (int j = 0; j < 3; ++j) {
+			int pid = tri.get_vtx_pnt_id(j);
+			triPts[j] = get_pnt(pid);
+			float* pUVData = get_attr_data_f(texAttrIdx, eAttrClass::POINT, pid, 2);
+			if (pUVData) {
+				triUVs[j].set(pUVData[0], pUVData[1]);
+			} else {
+				triUVs[j].set(0.0f, 0.0f);
+			}
+			cxVec dp1 = triPts[1] - triPts[0];
+			cxVec dp2 = triPts[2] - triPts[0];
+			xt_texcoord dt1;
+			dt1.set(triUVs[1].u - triUVs[0].u, triUVs[1].v - triUVs[0].v);
+			xt_texcoord dt2;
+			dt2.set(triUVs[2].u - triUVs[0].u, triUVs[2].v - triUVs[0].v);
+			float d = nxCalc::rcp0(dt1.u*dt2.v - dt1.v*dt2.u);
+			cxVec tu = (dp1*dt2.v - dp2*dt1.v) * d;
+			pTng[pid] = tu;
+		}
+	}
+	for (int i = 0; i < npnt; ++i) {
+		cxVec nrm;
+		float* pData = get_attr_data_f(nrmAttrIdx, eAttrClass::POINT, i, 3);
+		if (pData) {
+			nrm.from_mem(pData);
+		} else {
+			nrm.zero();
+		}
+		float d = nrm.dot(pTng[i]);
+		nrm.scl(d);
+		if (flip) {
+			pTng[i] = nrm - pTng[i];
+		} else {
+			pTng[i].sub(nrm);
+		}
+		pTng[i].normalize();
+	}
+}
+
+cxVec* sxGeometryData::calc_tangents(bool flip, const char* pAttrName) const {
+	int npnt = get_pnt_num();
+	cxVec* pTng = (cxVec*)nxCore::mem_alloc(npnt * sizeof(cxVec), XD_FOURCC('t', 'n', 'g', 'u'));
+	calc_tangents(pTng, flip, pAttrName);
+	return pTng;
 }
 
 uint8_t* sxGeometryData::Polygon::get_vtx_lst() const {
@@ -3680,31 +5746,634 @@ uint16_t* sxGeometryData::Group::get_skin_ids() const {
 	return pLst;
 }
 
+void sxGeometryData::DisplayList::create(const sxGeometryData& geo, const char* pBatGrpPrefix) {
+	int nmtl = geo.get_mtl_num();
+	int nbat = nmtl > 0 ? nmtl : 1;
+	int batGrpCount = 0;
+	int* pBatGrpIdx = nullptr;
+	if (pBatGrpPrefix) {
+		for (int i = 0; i < geo.get_pol_grp_num(); ++i) {
+			Group polGrp = geo.get_pol_grp(i);
+			if (polGrp.is_valid()) {
+				const char* pPolGrpName = polGrp.get_name();
+				if (nxCore::str_starts_with(pPolGrpName, pBatGrpPrefix)) {
+					++batGrpCount;
+				}
+			}
+		}
+		if (batGrpCount > 0) {
+			nbat = batGrpCount;
+			pBatGrpIdx = reinterpret_cast<int*>(nxCore::mem_alloc(batGrpCount * sizeof(int), XD_TMP_MEM_TAG));
+			batGrpCount = 0;
+			if (pBatGrpIdx) {
+				for (int i = 0; i < geo.get_pol_grp_num(); ++i) {
+					Group polGrp = geo.get_pol_grp(i);
+					if (polGrp.is_valid()) {
+						const char* pPolGrpName = polGrp.get_name();
+						if (nxCore::str_starts_with(pPolGrpName, pBatGrpPrefix)) {
+							pBatGrpIdx[batGrpCount] = i;
+							++batGrpCount;
+						}
+					}
+				}
+			}
+		}
+	}
+	int ntri = 0;
+	int nidx16 = 0;
+	int nidx32 = 0;
+	for (int i = 0; i < nbat; ++i) {
+		int npol = 0;
+		if (batGrpCount > 0) {
+			int batGrpIdx = pBatGrpIdx[i];
+			Group batGrp = geo.get_pol_grp(batGrpIdx);
+			npol = batGrp.get_idx_num();
+		} else {
+			if (nmtl > 0) {
+				Group mtlGrp = geo.get_mtl_grp(i);
+				npol = mtlGrp.get_idx_num();
+			} else {
+				npol = geo.get_pol_num();
+			}
+		}
+		int32_t minIdx = 0;
+		int32_t maxIdx = 0;
+		int batIdxCnt = 0;
+		for (int j = 0; j < npol; ++j) {
+			int polIdx = 0;
+			if (batGrpCount > 0) {
+				int batGrpIdx = pBatGrpIdx[i];
+				Group batGrp = geo.get_pol_grp(batGrpIdx);
+				polIdx = batGrp.get_idx(j);
+			} else {
+				if (nmtl > 0) {
+					polIdx = geo.get_mtl_grp(i).get_idx(j);
+				} else {
+					polIdx = j;
+				}
+			}
+			Polygon pol = geo.get_pol(polIdx);
+			if (pol.is_tri()) {
+				for (int k = 0; k < 3; ++k) {
+					int32_t vtxId = pol.get_vtx_pnt_id(k);
+					if (batIdxCnt > 0) {
+						minIdx = nxCalc::min(minIdx, vtxId);
+						maxIdx = nxCalc::max(maxIdx, vtxId);
+					} else {
+						minIdx = vtxId;
+						maxIdx = vtxId;
+					}
+					++batIdxCnt;
+				}
+				++ntri;
+			}
+		}
+		if ((maxIdx - minIdx) < (1 << 16)) {
+			nidx16 += batIdxCnt;
+		} else {
+			nidx32 += batIdxCnt;
+		}
+	}
+	size_t size = XD_ALIGN(sizeof(Data), 0x10);
+	uint32_t offsBat = (uint32_t)size;
+	size += XD_ALIGN(nbat * sizeof(Batch), 0x10);
+	uint32_t offsIdx32 = nidx32 > 0 ? (uint32_t)size : 0;
+	size += XD_ALIGN(nidx32 * sizeof(uint32_t), 0x10);
+	uint32_t offsIdx16 = nidx16 > 0 ? (uint32_t)size : 0;
+	size += XD_ALIGN(nidx16 * sizeof(uint16_t), 0x10);
+	Data* pData = (Data*)nxCore::mem_alloc(size, XD_FOURCC('G', 'D', 'L', 'D'));
+	if (!pData) {
+		return;
+	}
+	::memset(pData, 0, size);
+	pData->mOffsBat = offsBat;
+	pData->mOffsIdx32 = offsIdx32;
+	pData->mOffsIdx16 = offsIdx16;
+	pData->mIdx16Num = nidx16;
+	pData->mIdx32Num = nidx32;
+	pData->mMtlNum = nmtl;
+	pData->mBatNum = nbat;
+	pData->mTriNum = ntri;
+	mpGeo = &geo;
+	mpData = pData;
+	nidx16 = 0;
+	nidx32 = 0;
+	for (int i = 0; i < nbat; ++i) {
+		Batch* pBat = get_bat(i);
+		int npol = 0;
+		if (pBat) {
+			if (batGrpCount > 0) {
+				int batGrpIdx = pBatGrpIdx[i];
+				Group batGrp = geo.get_pol_grp(batGrpIdx);
+				pBat->mMtlId = geo.get_pol(batGrp.get_idx(0)).get_mtl_id();
+				if (geo.has_skin()) {
+					pBat->mMaxWgtNum = batGrp.get_max_wgt_num();
+				}
+				npol = batGrp.get_idx_num();
+			} else {
+				pBat->mGrpId = -1;
+				if (nmtl > 0) {
+					Group mtlGrp = geo.get_mtl_grp(i);
+					pBat->mMtlId = i;
+					if (geo.has_skin()) {
+						pBat->mMaxWgtNum = mtlGrp.get_max_wgt_num();
+					}
+					npol = mtlGrp.get_idx_num();
+				} else {
+					pBat->mMtlId = -1;
+					if (geo.has_skin()) {
+						pBat->mMaxWgtNum = geo.mMaxSkinWgtNum;
+					}
+					npol = geo.get_pol_num();
+				}
+			}
+			int batIdxCnt = 0;
+			pBat->mTriNum = 0;
+			for (int j = 0; j < npol; ++j) {
+				int polIdx = 0;
+				if (batGrpCount > 0) {
+					int batGrpIdx = pBatGrpIdx[i];
+					Group batGrp = geo.get_pol_grp(batGrpIdx);
+					polIdx = batGrp.get_idx(j);
+				} else {
+					if (nmtl > 0) {
+						polIdx = geo.get_mtl_grp(i).get_idx(j);
+					} else {
+						polIdx = j;
+					}
+				}
+				Polygon pol = geo.get_pol(polIdx);
+				if (pol.is_tri()) {
+					for (int k = 0; k < 3; ++k) {
+						int32_t vtxId = pol.get_vtx_pnt_id(k);
+						if (batIdxCnt > 0) {
+							pBat->mMinIdx = nxCalc::min(pBat->mMinIdx, vtxId);
+							pBat->mMaxIdx = nxCalc::max(pBat->mMaxIdx, vtxId);
+						} else {
+							pBat->mMinIdx = vtxId;
+							pBat->mMaxIdx = vtxId;
+						}
+						++batIdxCnt;
+					}
+					++pBat->mTriNum;
+				}
+			}
+			if (pBat->is_idx16()) {
+				pBat->mIdxOrg = nidx16;
+				nidx16 += batIdxCnt;
+			} else {
+				pBat->mIdxOrg = nidx32;
+				nidx32 += batIdxCnt;
+			}
+		}
+	}
+	nidx16 = 0;
+	nidx32 = 0;
+	for (int i = 0; i < nbat; ++i) {
+		Batch* pBat = get_bat(i);
+		int npol = 0;
+		if (pBat) {
+			if (batGrpCount > 0) {
+				int batGrpIdx = pBatGrpIdx[i];
+				Group batGrp = geo.get_pol_grp(batGrpIdx);
+				npol = batGrp.get_idx_num();
+			} else {
+				pBat->mGrpId = -1;
+				if (nmtl > 0) {
+					Group mtlGrp = geo.get_mtl_grp(i);
+					npol = mtlGrp.get_idx_num();
+				} else {
+					npol = geo.get_pol_num();
+				}
+			}
+			for (int j = 0; j < npol; ++j) {
+				int polIdx = 0;
+				if (batGrpCount > 0) {
+					int batGrpIdx = pBatGrpIdx[i];
+					Group batGrp = geo.get_pol_grp(batGrpIdx);
+					polIdx = batGrp.get_idx(j);
+				} else {
+					if (nmtl > 0) {
+						polIdx = geo.get_mtl_grp(i).get_idx(j);
+					} else {
+						polIdx = j;
+					}
+				}
+				Polygon pol = geo.get_pol(polIdx);
+				if (pol.is_tri()) {
+					if (pBat->is_idx16()) {
+						uint16_t* pIdx16 = pData->get_idx16();
+						if (pIdx16) {
+							for (int k = 0; k < 3; ++k) {
+								pIdx16[nidx16 + k] = (uint16_t)(pol.get_vtx_pnt_id(k) - pBat->mMinIdx);
+							}
+						}
+						nidx16 += 3;
+					} else {
+						uint32_t* pIdx32 = pData->get_idx32();
+						if (pIdx32) {
+							for (int k = 0; k < 3; ++k) {
+								pIdx32[nidx32 + k] = (uint32_t)(pol.get_vtx_pnt_id(k) - pBat->mMinIdx);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (pBatGrpIdx) {
+		nxCore::mem_free(pBatGrpIdx);
+		pBatGrpIdx = nullptr;
+	}
+}
+
+void sxGeometryData::DisplayList::destroy() {
+	if (mpData) {
+		nxCore::mem_free(mpData);
+	}
+	mpData = nullptr;
+	mpGeo = nullptr;
+}
+
+const char* sxGeometryData::DisplayList::get_bat_mtl_name(int batIdx) const {
+	const char* pMtlName = nullptr;
+	if (is_valid()) {
+		Batch* pBat = get_bat(batIdx);
+		if (pBat) {
+			pMtlName = mpGeo->get_mtl_name(pBat->mMtlId);
+		}
+	}
+	return pMtlName;
+}
+
+
+void sxDDSHead::init(uint32_t w, uint32_t h) {
+	::memset(this, 0, sizeof(sxDDSHead));
+	mMagic = XD_FOURCC('D', 'D', 'S', ' ');
+	mSize = sizeof(sxDDSHead) - 4;
+	mHeight = h;
+	mWidth = w;
+}
+
+void sxDDSHead::init_dds128(uint32_t w, uint32_t h) {
+	init(w, h);
+	mFlags = 0x081007;
+	mPitchLin = w * h * (sizeof(float) * 4);
+	mFormat.mSize = 0x20;
+	mFormat.mFlags = 4;
+	mFormat.mFourCC = 0x74;
+	mCaps1 = 0x1000;
+}
+
+void sxDDSHead::init_dds64(uint32_t w, uint32_t h) {
+	init(w, h);
+	mFlags = 0x081007;
+	mPitchLin = w * h * (sizeof(xt_half) * 4);
+	mFormat.mSize = 0x20;
+	mFormat.mFlags = 4;
+	mFormat.mFourCC = 0x71;
+	mCaps1 = 0x1000;
+}
+
+void sxDDSHead::init_dds32(uint32_t w, uint32_t h, bool encRGB) {
+	init(w, h);
+	mFlags = 0x081007;
+	mPitchLin = w * h * (sizeof(uint8_t) * 4);
+	mFormat.mSize = 0x20;
+	mFormat.mFlags = 0x41;
+	mFormat.mBitCount = 0x20;
+	if (encRGB) {
+		mFormat.mMaskR = 0xFF << 0;
+		mFormat.mMaskG = 0xFF << 8;
+		mFormat.mMaskB = 0xFF << 16;
+		mFormat.mMaskA = 0xFF << 24;
+	} else {
+		mFormat.mMaskR = 0xFF << 16;
+		mFormat.mMaskG = 0xFF << 8;
+		mFormat.mMaskB = 0xFF << 0;
+		mFormat.mMaskA = 0xFF << 24;
+	}
+	mCaps1 = 0x1000;
+}
+
 
 namespace nxTexture {
 
-sxDDSHead* alloc_dds128(int w, int h, uint32_t* pSize) {
+sxDDSHead* alloc_dds128(uint32_t w, uint32_t h, uint32_t* pSize) {
+	sxDDSHead* pDDS = nullptr;
 	uint32_t npix = w * h;
-	uint32_t dataSize = npix * sizeof(cxColor);
-	uint32_t size = sizeof(sxDDSHead) + dataSize;
-	sxDDSHead* pDDS = reinterpret_cast<sxDDSHead*>(nxCore::mem_alloc(size, XD_FOURCC('X', 'D', 'D', 'S')));
-	if (pDDS) {
-		::memset(pDDS, 0, sizeof(sxDDSHead));
-		pDDS->mMagic = XD_FOURCC('D', 'D', 'S', ' ');
-		pDDS->mSize = sizeof(sxDDSHead) - 4;
-		pDDS->mFlags = 0x081007;
-		pDDS->mHeight = h;
-		pDDS->mWidth = w;
-		pDDS->mPitchLin = dataSize;
-		pDDS->mFormat.mSize = 0x20;
-		pDDS->mFormat.mFlags = 4;
-		pDDS->mFormat.mFourCC = 0x74;
-		pDDS->mCaps1 = 0x1000;
-		if (pSize) {
-			*pSize = size;
+	if ((int)npix > 0) {
+		uint32_t dataSize = npix * sizeof(cxColor);
+		uint32_t size = sizeof(sxDDSHead) + dataSize;
+		pDDS = reinterpret_cast<sxDDSHead*>(nxCore::mem_alloc(size, XD_FOURCC('X', 'D', 'D', 'S')));
+		if (pDDS) {
+			pDDS->init_dds128(w, h);
+			if (pSize) {
+				*pSize = size;
+			}
 		}
 	}
 	return pDDS;
+}
+
+void save_dds128(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds128(w, h);
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			::fwrite(pClr, sizeof(cxColor), npix, pOut);
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds64(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds64(w, h);
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			xt_half4 h;
+			for (uint32_t i = 0; i < npix; ++i) {
+				cxColor c = pClr[i];
+				h.set(c.r, c.g, c.b, c.a);
+				::fwrite(&h, sizeof(h), 1, pOut);
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds32_rgbe(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds32(w, h);
+			dds.set_encoding(sxDDSHead::ENC_RGBE);
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			for (uint32_t i = 0; i < npix; ++i) {
+				uint32_t e = pClr[i].encode_rgbe();
+				::fwrite(&e, sizeof(e), 1, pOut);
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds32_bgre(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds32(w, h, false);
+			dds.set_encoding(sxDDSHead::ENC_BGRE);
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			for (uint32_t i = 0; i < npix; ++i) {
+				uint32_t e = pClr[i].encode_bgre();
+				::fwrite(&e, sizeof(e), 1, pOut);
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds32_rgbi(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds32(w, h);
+			dds.set_encoding(sxDDSHead::ENC_RGBI);
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			for (uint32_t i = 0; i < npix; ++i) {
+				uint32_t e = pClr[i].encode_rgbi();
+				::fwrite(&e, sizeof(e), 1, pOut);
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds32_bgri(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds32(w, h, false);
+			dds.set_encoding(sxDDSHead::ENC_BGRI);
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			for (uint32_t i = 0; i < npix; ++i) {
+				uint32_t e = pClr[i].encode_bgri();
+				::fwrite(&e, sizeof(e), 1, pOut);
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds32_rgba8(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h, float gamma) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds32(w, h);
+			if (gamma > 0.0f) {
+				dds.set_gamma(gamma);
+			} else {
+				dds.set_gamma(1.0f);
+			}
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			if (gamma > 0.0f && gamma != 1.0f) {
+				float invg = 1.0f / gamma;
+				for (uint32_t i = 0; i < npix; ++i) {
+					cxColor cc = pClr[i];
+					for (int j = 0; j < 4; ++j) {
+						cc.ch[j] = ::powf(cc.ch[j], invg);
+					}
+					uint32_t e = cc.encode_rgba8();
+					::fwrite(&e, sizeof(e), 1, pOut);
+				}
+			} else {
+				for (uint32_t i = 0; i < npix; ++i) {
+					uint32_t e = pClr[i].encode_rgba8();
+					::fwrite(&e, sizeof(e), 1, pOut);
+				}
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+void save_dds32_bgra8(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h, float gamma) {
+	uint32_t npix = w*h;
+	if ((int)npix > 0) {
+		FILE* pOut = nxSys::fopen_w_bin(pPath);
+		if (pOut) {
+			sxDDSHead dds = {};
+			dds.init_dds32(w, h, false);
+			if (gamma > 0.0f) {
+				dds.set_gamma(gamma);
+			} else {
+				dds.set_gamma(1.0f);
+			}
+			::fwrite(&dds, sizeof(dds), 1, pOut);
+			if (gamma > 0.0f && gamma != 1.0f) {
+				float invg = 1.0f / gamma;
+				for (uint32_t i = 0; i < npix; ++i) {
+					cxColor cc = pClr[i];
+					for (int j = 0; j < 4; ++j) {
+						cc.ch[j] = ::powf(cc.ch[j], invg);
+					}
+					uint32_t e = cc.encode_bgra8();
+					::fwrite(&e, sizeof(e), 1, pOut);
+				}
+			} else {
+				for (uint32_t i = 0; i < npix; ++i) {
+					uint32_t e = pClr[i].encode_bgra8();
+					::fwrite(&e, sizeof(e), 1, pOut);
+				}
+			}
+			::fclose(pOut);
+		}
+	}
+}
+
+cxColor* decode_dds(sxDDSHead* pDDS, uint32_t* pWidth, uint32_t* pHeight, float gamma) {
+	if (!pDDS) return nullptr;
+	int w = pDDS->mWidth;
+	int h = pDDS->mHeight;
+	int n = w * h;
+	size_t size = n * sizeof(cxColor);
+	if (pWidth) {
+		*pWidth = w;
+	}
+	if (pHeight) {
+		*pHeight = h;
+	}
+	cxColor* pClr = (cxColor*)nxCore::mem_alloc(size, XD_FOURCC('D', 'D', 'S', 'C'));
+	if (pClr) {
+		if (pDDS->is_dds128()) {
+			::memcpy(pClr, pDDS + 1, size);
+		} else if (pDDS->is_dds64()) {
+			xt_half4* pHalf = (xt_half4*)(pDDS + 1);
+			xt_float4* pFloat = (xt_float4*)pClr;
+			for (int i = 0; i < n; ++i) {
+				pFloat[i] = pHalf[i].get();
+			}
+		} else if (pDDS->is_dds32()) {
+			if (pDDS->get_encoding() == sxDDSHead::ENC_RGBE) {
+				uint32_t* pRGBE = (uint32_t*)(pDDS + 1);
+				for (int i = 0; i < n; ++i) {
+					pClr[i].decode_rgbe(pRGBE[i]);
+				}
+			} else if (pDDS->get_encoding() == sxDDSHead::ENC_BGRE) {
+				uint32_t* pBGRE = (uint32_t*)(pDDS + 1);
+				for (int i = 0; i < n; ++i) {
+					pClr[i].decode_bgre(pBGRE[i]);
+				}
+			} else if (pDDS->get_encoding() == sxDDSHead::ENC_RGBI) {
+				uint32_t* pRGBI = (uint32_t*)(pDDS + 1);
+				for (int i = 0; i < n; ++i) {
+					pClr[i].decode_rgbi(pRGBI[i]);
+				}
+			} else if (pDDS->get_encoding() == sxDDSHead::ENC_BGRI) {
+				uint32_t* pBGRI = (uint32_t*)(pDDS + 1);
+				for (int i = 0; i < n; ++i) {
+					pClr[i].decode_bgri(pBGRI[i]);
+				}
+			} else {
+				float wg = pDDS->get_gamma();
+				if (wg <= 0.0f) wg = gamma;
+				uint32_t maskR = pDDS->mFormat.mMaskR;
+				uint32_t maskG = pDDS->mFormat.mMaskG;
+				uint32_t maskB = pDDS->mFormat.mMaskB;
+				uint32_t maskA = pDDS->mFormat.mMaskA;
+				uint32_t shiftR = nxCore::ctz32(maskR);
+				uint32_t shiftG = nxCore::ctz32(maskG);
+				uint32_t shiftB = nxCore::ctz32(maskB);
+				uint32_t shiftA = nxCore::ctz32(maskA);
+				uint32_t* pEnc32 = (uint32_t*)(pDDS + 1);
+				for (int i = 0; i < n; ++i) {
+					uint32_t enc = pEnc32[i];
+					uint32_t ir = (enc & maskR) >> shiftR;
+					uint32_t ig = (enc & maskG) >> shiftG;
+					uint32_t ib = (enc & maskB) >> shiftB;
+					uint32_t ia = (enc & maskA) >> shiftA;
+					pClr[i].r = (float)(int)ir;
+					pClr[i].g = (float)(int)ig;
+					pClr[i].b = (float)(int)ib;
+					pClr[i].a = (float)(int)ia;
+				}
+				float scl[4];
+				scl[0] = nxCalc::rcp0((float)(int)(maskR >> shiftR));
+				scl[1] = nxCalc::rcp0((float)(int)(maskG >> shiftG));
+				scl[2] = nxCalc::rcp0((float)(int)(maskB >> shiftB));
+				scl[3] = nxCalc::rcp0((float)(int)(maskA >> shiftA));
+				for (int i = 0; i < n; ++i) {
+					float* pDst = pClr[i].ch;
+					for (int j = 0; j < 4; ++j) {
+						pDst[j] *= scl[j];
+					}
+				}
+				if (wg > 0.0f) {
+					for (int i = 0; i < n; ++i) {
+						float* pDst = pClr[i].ch;
+						for (int j = 0; j < 4; ++j) {
+							pDst[j] = ::powf(pDst[j], wg);
+						}
+					}
+				}
+			}
+		} else {
+			nxSys::dbgmsg("unsupported DDS format\n");
+			for (int i = 0; i < n; ++i) {
+				pClr[i].zero_rgb();
+			}
+		}
+	}
+	return pClr;
+}
+
+/* see PBRT book for details */
+void calc_resample_wgts(int oldRes, int newRes, xt_float4* pWgt, int16_t* pOrg) {
+	float rt = float(oldRes) / float(newRes);
+	float fw = 2.0f;
+	for (int i = 0; i < newRes; ++i) {
+		float c = (float(i) + 0.5f) * rt;
+		float org = ::floorf((c - fw) + 0.5f);
+		pOrg[i] = (int16_t)org;
+		float* pW = pWgt[i];
+		float s = 0.0f;
+		for (int j = 0; j < 4; ++j) {
+			float pos = org + float(j) + 0.5f;
+			float x = ::fabsf((pos - c) / fw);
+			float w;
+			if (x < 1.0e-5f) {
+				w = 1.0f;
+			} else if (x > 1.0f) {
+				w = 1.0f;
+			} else {
+				x *= XD_PI;
+				w = nxCalc::sinc(x*2.0f) * nxCalc::sinc(x);
+			}
+			pW[j] = w;
+			s += w;
+		}
+		s = nxCalc::rcp0(s);
+		pWgt[i].scl(s);
+	}
 }
 
 } // nxTexture
@@ -3834,6 +6503,23 @@ sxTextureData::Plane sxTextureData::get_plane(int idx) const {
 	return plane;
 }
 
+bool sxTextureData::is_plane_hdr(int idx) const {
+	bool res = false;
+	PlaneInfo* pInfo = get_plane_info(idx);
+	if (pInfo) {
+		res = pInfo->mMinVal < 0.0f || pInfo->mMaxVal > 1.0f;
+	}
+	return res;
+}
+
+bool sxTextureData::is_hdr() const {
+	int n = mPlaneNum;
+	for (int i = 0; i < n; ++i) {
+		if (is_plane_hdr(i)) return true;
+	}
+	return false;
+}
+
 void sxTextureData::get_rgba(float* pDst) const {
 	if (!pDst) return;
 	int w = get_width();
@@ -3872,7 +6558,7 @@ sxTextureData::DDS sxTextureData::get_dds() const {
 	return dds;
 }
 
-void sxTextureData::DDS::release() {
+void sxTextureData::DDS::free() {
 	if (mpHead) {
 		nxCore::mem_free(mpHead);
 	}
@@ -3883,36 +6569,6 @@ void sxTextureData::DDS::release() {
 void sxTextureData::DDS::save(const char* pOutPath) const {
 	if (is_valid()) {
 		nxCore::bin_save(pOutPath, mpHead, mSize);
-	}
-}
-
-/* see PBRT book for details */
-static void calc_resample_wgts(int oldRes, int newRes, xt_float4* pWgt, int16_t* pOrg) {
-	float rt = float(oldRes) / float(newRes);
-	float fw = 2.0f;
-	for (int i = 0; i < newRes; ++i) {
-		float c = (float(i) + 0.5f) * rt;
-		float org = ::floorf((c - fw) + 0.5f);
-		pOrg[i] = (int16_t)org;
-		float* pW = pWgt[i];
-		float s = 0.0f;
-		for (int j = 0; j < 4; ++j) {
-			float pos = org + float(j) + 0.5f;
-			float x = ::fabsf((pos - c) / fw);
-			float w;
-			if (x < 1.0e-5f) {
-				w = 1.0f;
-			} else if (x > 1.0f) {
-				w = 1.0f;
-			} else {
-				x *= XD_PI;
-				w = nxCalc::sinc(x*2.0f) * nxCalc::sinc(x);
-			}
-			pW[j] = w;
-			s += w;
-		}
-		s = nxCalc::rcp0(s);
-		pWgt[i].scl(s);
 	}
 }
 
@@ -3961,7 +6617,7 @@ sxTextureData::Pyramid* sxTextureData::get_pyramid() const {
 		xt_float4* pWgt = reinterpret_cast<xt_float4*>(nxCore::mem_alloc(wgtNum*sizeof(xt_float4), XD_TMP_MEM_TAG));
 		int16_t* pOrg = reinterpret_cast<int16_t*>(nxCore::mem_alloc(wgtNum*sizeof(int16_t), XD_TMP_MEM_TAG));
 		cxColor* pTmp = reinterpret_cast<cxColor*>(nxCore::mem_alloc(wgtNum*sizeof(cxColor), XD_TMP_MEM_TAG));
-		calc_resample_wgts(w0, baseW, pWgt, pOrg);
+		nxTexture::calc_resample_wgts(w0, baseW, pWgt, pOrg);
 		for (int y = 0; y < h0; ++y) {
 			for (int x = 0; x < baseW; ++x) {
 				cxColor clr;
@@ -3976,7 +6632,7 @@ sxTextureData::Pyramid* sxTextureData::get_pyramid() const {
 				pLvl[y*baseW + x] = clr;
 			}
 		}
-		calc_resample_wgts(h0, baseH, pWgt, pOrg);
+		nxTexture::calc_resample_wgts(h0, baseH, pWgt, pOrg);
 		for (int x = 0; x < baseW; ++x) {
 			for (int y = 0; y < baseH; ++y) {
 				cxColor clr;
@@ -4062,6 +6718,99 @@ sxTextureData::DDS sxTextureData::Pyramid::get_lvl_dds(int idx) const {
 	return dds;
 }
 
+
+
+float sxKeyframesData::RigLink::Node::get_pos_chan(int idx) {
+	float val = 0.0f;
+	if ((uint32_t)idx < 3) {
+		Val* pVal = get_pos_val();
+		if (pVal && pVal->fcvId[idx] >= 0) {
+			val = pVal->f3[idx];
+		}
+	}
+	return val;
+}
+
+float sxKeyframesData::RigLink::Node::get_rot_chan(int idx) {
+	float val = 0.0f;
+	if ((uint32_t)idx < 3) {
+		Val* pVal = get_rot_val();
+		if (pVal && pVal->fcvId[idx] >= 0) {
+			val = pVal->f3[idx];
+		}
+	}
+	return val;
+}
+
+float sxKeyframesData::RigLink::Node::get_scl_chan(int idx) {
+	float val = 1.0f;
+	if ((uint32_t)idx < 3) {
+		Val* pVal = get_scl_val();
+		if (pVal && pVal->fcvId[idx] >= 0) {
+			val = pVal->f3[idx];
+		}
+	}
+	return val;
+}
+
+float sxKeyframesData::RigLink::Node::get_anim_chan(exAnimChan chan) {
+	float val = 0.0f;
+	switch (chan) {
+		case exAnimChan::TX: val = get_pos_chan(0); break;
+		case exAnimChan::TY: val = get_pos_chan(1); break;
+		case exAnimChan::TZ: val = get_pos_chan(2); break;
+		case exAnimChan::RX: val = get_rot_chan(0); break;
+		case exAnimChan::RY: val = get_rot_chan(1); break;
+		case exAnimChan::RZ: val = get_rot_chan(2); break;
+		case exAnimChan::SX: val = get_scl_chan(0); break;
+		case exAnimChan::SY: val = get_scl_chan(1); break;
+		case exAnimChan::SZ: val = get_scl_chan(2); break;
+	}
+	return val;
+}
+
+bool sxKeyframesData::RigLink::Node::ck_pos_chan(int idx) {
+	bool res = false;
+	if ((uint32_t)idx < 3) {
+		Val* pVal = get_pos_val();
+		res = (pVal && pVal->fcvId[idx] >= 0);
+	}
+	return res;
+}
+
+bool sxKeyframesData::RigLink::Node::ck_rot_chan(int idx) {
+	bool res = false;
+	if ((uint32_t)idx < 3) {
+		Val* pVal = get_rot_val();
+		res = (pVal && pVal->fcvId[idx] >= 0);
+	}
+	return res;
+}
+
+bool sxKeyframesData::RigLink::Node::ck_scl_chan(int idx) {
+	bool res = false;
+	if ((uint32_t)idx < 3) {
+		Val* pVal = get_scl_val();
+		res = (pVal && pVal->fcvId[idx] >= 0);
+	}
+	return res;
+}
+
+bool sxKeyframesData::RigLink::Node::ck_anim_chan(exAnimChan chan) {
+	bool res = false;
+	switch (chan) {
+		case exAnimChan::TX: res = ck_pos_chan(0); break;
+		case exAnimChan::TY: res = ck_pos_chan(1); break;
+		case exAnimChan::TZ: res = ck_pos_chan(2); break;
+		case exAnimChan::RX: res = ck_rot_chan(0); break;
+		case exAnimChan::RY: res = ck_rot_chan(1); break;
+		case exAnimChan::RZ: res = ck_rot_chan(2); break;
+		case exAnimChan::SX: res = ck_scl_chan(0); break;
+		case exAnimChan::SY: res = ck_scl_chan(1); break;
+		case exAnimChan::SZ: res = ck_scl_chan(2); break;
+	}
+	return res;
+}
 
 bool sxKeyframesData::has_node_info() const {
 	bool res = false;
@@ -4290,6 +7039,15 @@ float sxKeyframesData::FCurve::eval(float frm, bool extrapolate) const {
 	return val;
 }
 
+const char* sxKeyframesData::get_node_name(int idx) const {
+	const char* pName = nullptr;
+	NodeInfo* pInfo = get_node_info_ptr(idx);
+	if (pInfo) {
+		pName = get_str(pInfo->mNameId);
+	}
+	return pName;
+}
+
 int sxKeyframesData::find_fcv_idx(const char* pNodeName, const char* pChanName, const char* pNodePath) const {
 	int idx = -1;
 	sxStrList* pStrLst = get_str_list();
@@ -4397,6 +7155,7 @@ sxKeyframesData::RigLink* sxKeyframesData::make_rig_link(const sxRigData& rig) c
 				}
 				RigLink::Val* pVal = (RigLink::Val*)XD_INCR_PTR(pLink, valTop);
 				RigLink::Node* pLinkNode = pLink->mNodes;
+				int inode = 0;
 				for (int i = 0; i < n; ++i) {
 					NodeInfo* pNodeInfo = get_node_info_ptr(i);
 					if (pNodeInfo) {
@@ -4451,7 +7210,8 @@ sxKeyframesData::RigLink* sxKeyframesData::make_rig_link(const sxRigData& rig) c
 									pLinkNode->mSclValOffs = (uint32_t)((uint8_t*)pVal - (uint8_t*)pLinkNode);
 									++pVal;
 								}
-								pRigMap[rigNodeId] = i;
+								pRigMap[rigNodeId] = inode;
+								++inode;
 								++pLinkNode;
 							}
 						}
@@ -4463,101 +7223,107 @@ sxKeyframesData::RigLink* sxKeyframesData::make_rig_link(const sxRigData& rig) c
 	return pLink;
 }
 
+void sxKeyframesData::eval_rig_link_node(RigLink* pLink, int nodeIdx, float frm, const sxRigData* pRig, cxMtx* pRigLocalMtx) const {
+	if (!pLink) return;
+	if (!pLink->ck_node_idx(nodeIdx)) return;
+	const int POS_MASK = 1 << 0;
+	const int ROT_MASK = 1 << 1;
+	const int SCL_MASK = 1 << 2;
+	int xformMask = 0;
+	RigLink::Node* pNode = &pLink->mNodes[nodeIdx];
+	RigLink::Val* pPosVal = pNode->get_pos_val();
+	if (pPosVal) {
+		for (int j = 0; j < 3; ++j) {
+			int fcvId = pPosVal->fcvId[j];
+			if (ck_fcv_idx(fcvId)) {
+				xformMask |= POS_MASK;
+				FCurve fcv = get_fcv(fcvId);
+				if (fcv.is_valid()) {
+					pPosVal->f3[j] = fcv.eval(frm);
+				}
+			}
+		}
+	}
+	RigLink::Val* pRotVal = pNode->get_rot_val();
+	if (pRotVal) {
+		int ifrm = (int)frm;
+		if (pNode->mUseSlerp && frm != (float)ifrm) {
+			cxVec rot0(0.0f);
+			cxVec rot1(0.0f);
+			for (int j = 0; j < 3; ++j) {
+				int fcvId = pRotVal->fcvId[j];
+				if (ck_fcv_idx(fcvId)) {
+					xformMask |= ROT_MASK;
+					FCurve fcv = get_fcv(fcvId);
+					if (fcv.is_valid()) {
+						rot0.set_at(j, fcv.eval((float)ifrm));
+						rot1.set_at(j, fcv.eval((float)(ifrm + 1)));
+					}
+				}
+			}
+			cxQuat q0;
+			q0.set_rot_degrees(rot0, pNode->mRotOrd);
+			cxQuat q1;
+			q1.set_rot_degrees(rot1, pNode->mRotOrd);
+			cxQuat qr = nxQuat::slerp(q0, q1, frm - (float)ifrm);
+			cxVec rv = qr.get_rot_degrees(pNode->mRotOrd);
+			pRotVal->set_vec(rv);
+		} else {
+			for (int j = 0; j < 3; ++j) {
+				int fcvId = pRotVal->fcvId[j];
+				if (ck_fcv_idx(fcvId)) {
+					xformMask |= ROT_MASK;
+					FCurve fcv = get_fcv(fcvId);
+					if (fcv.is_valid()) {
+						pRotVal->f3[j] = fcv.eval(frm);
+					}
+				}
+			}
+		}
+	}
+	RigLink::Val* pSclVal = pNode->get_scl_val();
+	if (pSclVal) {
+		for (int j = 0; j < 3; ++j) {
+			int fcvId = pSclVal->fcvId[j];
+			if (ck_fcv_idx(fcvId)) {
+				xformMask |= SCL_MASK;
+				FCurve fcv = get_fcv(fcvId);
+				if (fcv.is_valid()) {
+					pSclVal->f3[j] = fcv.eval(frm);
+				}
+			}
+		}
+	}
+	if (xformMask && pRig && pRigLocalMtx) {
+		cxMtx sm;
+		cxMtx rm;
+		cxMtx tm;
+		exRotOrd rord = pNode->mRotOrd;
+		exTransformOrd xord = pNode->mXformOrd;
+		if (xformMask & SCL_MASK) {
+			sm.mk_scl(pSclVal->get_vec());
+		} else {
+			sm.mk_scl(pRig->get_lscl(pNode->mRigNodeId));
+		}
+		if (xformMask & ROT_MASK) {
+			rm.set_rot_degrees(pRotVal->get_vec(), rord);
+		} else {
+			rm.set_rot_degrees(pRig->get_lrot(pNode->mRigNodeId));
+		}
+		if (xformMask & POS_MASK) {
+			tm.mk_translation(pPosVal->get_vec());
+		} else {
+			tm.mk_translation(pRig->get_lpos(pNode->mRigNodeId));
+		}
+		pRigLocalMtx[pNode->mRigNodeId].calc_xform(tm, rm, sm, xord);
+	}
+}
+
 void sxKeyframesData::eval_rig_link(RigLink* pLink, float frm, const sxRigData* pRig, cxMtx* pRigLocalMtx) const {
 	if (!pLink) return;
-	const int POS_MASK = 1<<0;
-	const int ROT_MASK = 1<<1;
-	const int SCL_MASK = 1<<2;
 	int n = pLink->mNodeNum;
 	for (int i = 0; i < n; ++i) {
-		int xformMask = 0;
-		RigLink::Node* pNode = &pLink->mNodes[i];
-		RigLink::Val* pPosVal = pNode->get_pos_val();
-		if (pPosVal) {
-			for (int j = 0; j < 3; ++j) {
-				int fcvId = pPosVal->fcvId[j];
-				if (ck_fcv_idx(fcvId)) {
-					xformMask |= POS_MASK;
-					FCurve fcv = get_fcv(fcvId);
-					if (fcv.is_valid()) {
-						pPosVal->f3[j] = fcv.eval(frm);
-					}
-				}
-			}
-		}
-		RigLink::Val* pRotVal = pNode->get_rot_val();
-		if (pRotVal) {
-			int ifrm = (int)frm;
-			if (pNode->mUseSlerp && frm != (float)ifrm) {
-				cxVec rot0(0.0f);
-				cxVec rot1(0.0f);
-				for (int j = 0; j < 3; ++j) {
-					int fcvId = pRotVal->fcvId[j];
-					if (ck_fcv_idx(fcvId)) {
-						xformMask |= ROT_MASK;
-						FCurve fcv = get_fcv(fcvId);
-						if (fcv.is_valid()) {
-							rot0.set_at(j, fcv.eval((float)ifrm));
-							rot1.set_at(j, fcv.eval((float)(ifrm+1)));
-						}
-					}
-				}
-				cxQuat q0;
-				q0.set_rot_degrees(rot0, pNode->mRotOrd);
-				cxQuat q1;
-				q1.set_rot_degrees(rot1, pNode->mRotOrd);
-				cxQuat qr = nxQuat::slerp(q0, q1, frm - (float)ifrm);
-				cxVec rv = qr.get_rot_degrees(pNode->mRotOrd);
-				pRotVal->set_vec(rv);
-			} else {
-				for (int j = 0; j < 3; ++j) {
-					int fcvId = pRotVal->fcvId[j];
-					if (ck_fcv_idx(fcvId)) {
-						xformMask |= ROT_MASK;
-						FCurve fcv = get_fcv(fcvId);
-						if (fcv.is_valid()) {
-							pRotVal->f3[j] = fcv.eval(frm);
-						}
-					}
-				}
-			}
-		}
-		RigLink::Val* pSclVal = pNode->get_scl_val();
-		if (pSclVal) {
-			for (int j = 0; j < 3; ++j) {
-				int fcvId = pSclVal->fcvId[j];
-				if (ck_fcv_idx(fcvId)) {
-					xformMask |= SCL_MASK;
-					FCurve fcv = get_fcv(fcvId);
-					if (fcv.is_valid()) {
-						pSclVal->f3[j] = fcv.eval(frm);
-					}
-				}
-			}
-		}
-		if (xformMask && pRig && pRigLocalMtx) {
-			cxMtx sm;
-			cxMtx rm;
-			cxMtx tm;
-			exRotOrd rord = pNode->mRotOrd;
-			exTransformOrd xord = pNode->mXformOrd;
-			if (xformMask & SCL_MASK) {
-				sm.mk_scl(pSclVal->get_vec());
-			} else {
-				sm.mk_scl(pRig->get_lscl(pNode->mRigNodeId));
-			}
-			if (xformMask & ROT_MASK) {
-				rm.set_rot_degrees(pRotVal->get_vec(), rord);
-			} else {
-				rm.set_rot_degrees(pRig->get_lrot(pNode->mRigNodeId));
-			}
-			if (xformMask & POS_MASK) {
-				tm.mk_translation(pPosVal->get_vec());
-			} else {
-				tm.mk_translation(pRig->get_lpos(pNode->mRigNodeId));
-			}
-			pRigLocalMtx[pNode->mRigNodeId].calc_xform(tm, rm, sm, xord);
-		}
+		eval_rig_link_node(pLink, i, frm, pRig, pRigLocalMtx);
 	}
 }
 

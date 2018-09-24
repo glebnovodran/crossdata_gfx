@@ -1,3 +1,5 @@
+// Author: Sergey Chaban <sergey.chaban@gmail.com>
+
 #include "shader.h"
 #include "context.h"
 
@@ -19,6 +21,8 @@ SamplerState g_smpLin : register(s0);
 SamplerState g_smpPnt : register(s1);
 
 #include "SH.h"
+#include "pano.h"
+#include "color.h"
 
 struct MTL_GEOM {
 	float3 pos;
@@ -54,6 +58,11 @@ struct MTL_LIT {
 	float3 refl;
 };
 
+struct MTL_SDW {
+	float sval;
+	float val;
+};
+
 struct MTL_FOG {
 	float3 add;
 	float3 mul;
@@ -67,6 +76,7 @@ struct MTL_WK {
 	MTL_UV uv;
 	MTL_TEX tex;
 	MTL_LIT lit;
+	MTL_SDW sdw;
 	MTL_FOG fog;
 };
 
@@ -80,22 +90,14 @@ float3 calcSpecFresnel(float tcos, float3 ior) {
 	return approxFresnelSchlick(tcos, ior);
 }
 
+float calcViewFresnel(float tcos, float gain, float bias) {
+	return 1 - saturate((pow(1 - tcos, 5) * gain) + bias);
+}
+
 float3 calcDiffFresnel(float nl, float nv, float3 ior) {
 	float3 r = (ior - 1) / (ior + 1);
 	float3 f0 = r*r;
 	return (21.0/20.0f) * (1 - f0) * pow(1 - nl, 5) * pow(1 - nv, 5);
-}
-
-float4 smpPanorama(float3 dir, float lvl) {
-	float2 uv = (float2)0.0;
-	float lxz = sqrt(dir.x*dir.x + dir.z*dir.z);
-	if (lxz > 1.0e-5) uv.x = -dir.x / lxz;
-	uv.y = dir.y;
-	uv = clamp(uv, -1.0, 1.0);
-	uv = acos(uv) / PI;
-	uv.x *= 0.5;
-	if (dir.z >= 0.0) uv.x = 1.0 - uv.x;
-	return g_texRefl.SampleLevel(g_smpLin, uv, lvl, 0);
 }
 
 bool lightRadiusCk(float3 pos, int lidx) {
@@ -112,6 +114,11 @@ MTL_WK calcLight(MTL_WK wk) {
 	float3 N = wk.geom.nrm;
 	float3 V = -wk.view.dir;
 	float3 R = wk.view.refl;
+	float NV = dot(N, V);
+	float nv = max(0.0, NV);
+
+	float3 drough = clamp(mtl.diffRoughness * lerp(1.0, wk.tex.spec.a, mtl.diffRoughnessTexRate), 1e-6, 1.0);
+	float3 srough = clamp(mtl.specRoughness * lerp(1.0, wk.tex.spec.a, mtl.specRoughnessTexRate), mtl.specRoughnessMin, 1.0);
 
 	if (lctx.maxDynIdx >= 0) {
 		[unroll(D_GEX_MAX_DYN_LIGHTS)]
@@ -135,11 +142,9 @@ MTL_WK calcLight(MTL_WK wk) {
 				float3 H = normalize(L+V);
 				float NL = dot(N, L);
 				float NH = dot(N, H);
-				float NV = dot(N, V);
 				float LH = dot(L, H);
 				float nl = max(0.0, NL);
 				float nh = max(0.0, NH);
-				float nv = max(0.0, NV);
 				float lh = max(0.0, LH);
 
 				float distAttn = 1.0;
@@ -159,7 +164,6 @@ MTL_WK calcLight(MTL_WK wk) {
 				}
 
 				float3 diff = 0;
-				float3 drough = max(1e-6, mtl.diffRoughness);
 				if (mtl.diffMode == D_GEX_DIFF_WRAP) {
 					float dval = abs(NL*mtl.diffWrapGain + mtl.diffWrapBias);
 					float3 dexp = (1 - drough)*mtl.diffExpGain + mtl.diffExpBias;
@@ -190,10 +194,10 @@ MTL_WK calcLight(MTL_WK wk) {
 
 				float3 spec = 0;
 				float3 sval = 0;
-				float3 srough = max(1e-6, mtl.specRoughness);
 				float3 srr = srough*srough;
 				if (mtl.specMode == D_GEX_SPEC_BLINN) {
 					sval = pow((float3)nh, max(0.001, 2.0/(srr*srr) - 2.0));
+					sval *= mtl.specFresnelMode ? 12 : 1; //TODO
 				} else if (mtl.specMode == D_GEX_SPEC_GGX) {
 					float3 srr2 = srr*srr;
 					float3 dv = nh*nh*(srr2-1.0) + 1.0;
@@ -206,11 +210,14 @@ MTL_WK calcLight(MTL_WK wk) {
 					/* Phong/default */
 					float vr = max(0.0, dot(V, reflect(-L, N)));
 					sval = pow((float3)vr, max(0.001, 2.0/srr - 2.0)) / 2.0;
+					sval *= mtl.specFresnelMode ? 16 : 1; //TODO
 				}
 				spec = sval * lspec;
 				if (mtl.specFresnelMode) {
 					spec *= calcSpecFresnel(lh, mtl.IOR);
 				}
+
+				spec *= 1.0 - lerp(wk.sdw.sval, wk.sdw.val, g_sdw[0].specValSel)*(i == g_sdw[0].litIdx);
 
 				diff *= distAttn;
 				diff *= angAttn;
@@ -227,6 +234,7 @@ MTL_WK calcLight(MTL_WK wk) {
 	lit.diff += hemi;
 
 	if (lctx.shMode != D_GEX_SHL_NONE) {
+		float3 shDiff = 0;
 		if (lctx.shMode == D_GEX_SHL_DIFF) {
 			float3 shc[3*3];
 			float shw[3];
@@ -234,30 +242,44 @@ MTL_WK calcLight(MTL_WK wk) {
 			shw[0] = 1.0;
 			shw[1] = 1.0 / 1.5;
 			shw[2] = 1.0 / 4.0;
-			float3 shDiff;
 			shApply3(shDiff, shc, shw, N.x, N.y, N.z);
-			lit.diff += shDiff * g_mtl[0].shDiffClr;
 		} else {
+			// D_GEX_SHL_DIFF_REFL
 			float3 shc[6*6];
 			float2 shw[6];
 			shGet6(shc, shw);
 			float shDiffDtl = g_mtl[0].shDiffDtl;
 			float shReflDtl = g_mtl[0].shReflDtl;
+#if 1
+			shReflDtl += lerp(24, 1, saturate((srough.r + srough.g + srough.b) / 3.0));
+#endif
 			[unroll(6)] for (int i = 0; i < 6; ++i) {
 				float ii = (float)(-i*i);
-				float wd = ii / (2.0 * shDiffDtl);
-				float wr = ii / (2.0 * shReflDtl);
-				shw[i].x = exp(wd);
-				shw[i].y = exp(wr);
+				float2 wdr = ii / (2.0 * float2(shDiffDtl, shReflDtl));
+				shw[i] = exp(wdr);
 			}
-			float3 shDiff;
+#if 1
+			float t = NV;
+			float r = max(0.1, (drough.r + drough.g + drough.b) / 3.0);
+			float s = 1.0 / (r*r / 2.0);
+			float f = 1.0 - 1.0/(2.0 + s*0.65);
+			float g = 1.0 / (2.22222 + s*0.1);
+			float adjDC = f + g*0.5*(1.0 + 2.0*acos(t)/PI - t);
+			float adjLin = f + (f - 1.0) * (1.0 - t);
+			shw[0].x *= adjDC;
+			shw[1].x *= adjLin;
+#endif
 			float3 shRefl;
 			shApply6(shDiff, shRefl, shc, shw, float2(N.x, R.x), float2(N.y, R.y), float2(N.z, R.z));
-			shDiff *= g_mtl[0].shDiffClr;
+			shRefl = lerp(shRefl, shRefl * calcSpecFresnel(nv, g_mtl[0].IOR), g_mtl[0].shReflFrRate);
 			shRefl *= g_mtl[0].shReflClr;
-			lit.diff += shDiff;
+			shRefl *= g_glb[0].reflSHFactor;
+			shRefl = max(shRefl, 0);
 			lit.refl += shRefl;
 		}
+		shDiff *= g_mtl[0].shDiffClr;
+		shDiff *= g_glb[0].diffSHFactor;
+		lit.diff += shDiff;
 	}
 
 	wk.lit = lit;
@@ -371,21 +393,35 @@ float shadowVal(float4 spos) {
 	return shadowVal4W(spos);
 }
 
-
-float4 tgtColor(float4 clr) {
-	GLB_CTX glb = g_glb[0];
-	float3 c = clr.rgb;
-
-	c = (c * (1 + c / glb.linWhite)) / (1 + c);
-	c *= glb.linGain;
-	c += glb.linBias;
-	clr.rgb = c;
-
-	clr = max(clr, 0);
-	clr = pow(clr, glb.invGamma);
-
-	return clr;
+MTL_WK calcShadow(MTL_WK wk) {
+	MTL_SDW sdw = (MTL_SDW)0;
+	if (g_mtl[0].receiveShadows) {
+		float3 wpos = wk.geom.pos;
+		float4 spos = mul(float4(wpos, 1), g_sdw[0].xform);
+		float4 scp = spos.xyzz/spos.w;
+		if (all(scp.xyz>=0) && all(scp.xyz<=1)) {
+			bool scull = g_mtl[0].cullShadows ? dot(wk.geom.nrm, -g_sdw[0].dir) < 0 : false;
+			if (!scull) {
+				float sval = shadowVal(spos);
+				sdw.sval = sval;
+				float sdens = g_sdw[0].color.a * g_mtl[0].shadowDensity;
+				sval *= sdens;
+				float2 sfade = g_sdw[0].fade;
+				float fadeInvRange = sfade.y;
+				if (fadeInvRange > 0) {
+					float sdist = -mul(float4(wpos, 1), g_cam[0].view).z;
+					float fadeStart = sfade.x;
+					float fadeVal = 1.0 - saturate((sdist - fadeStart) * fadeInvRange);
+					sval *= fadeVal;
+				}
+				sdw.val = sval;
+			}
+		}
+	}
+	wk.sdw = sdw;
+	return wk;
 }
+
 
 float4 main(float4 scrPos : SV_POSITION, GEO_INFO geo : TEXCOORD, bool frontFaceFlg : SV_IsFrontFace) : SV_TARGET {
 	CAM_CTX cam = g_cam[0];
@@ -461,6 +497,7 @@ float4 main(float4 scrPos : SV_POSITION, GEO_INFO geo : TEXCOORD, bool frontFace
 	wk.tex.spec = g_texSpec.Sample(g_smpLin, wk.uv.spec);
 	wk.tex.spec.rgb *= mtl.specColor;
 
+	wk = calcShadow(wk);
 	wk = calcLight(wk);
 	if (mtl.vclrMode) {
 		wk.lit.diff += wk.geom.vclr.rgb;
@@ -469,11 +506,14 @@ float4 main(float4 scrPos : SV_POSITION, GEO_INFO geo : TEXCOORD, bool frontFace
 	}
 	float reflLvl = g_mtl[0].reflLvl;
 	if (reflLvl >= 0) {
-		float4 refl = smpPanorama(wk.view.refl, reflLvl);
+		float4 refl = smpPanorama(g_texRefl, wk.view.refl, reflLvl);
 		wk.lit.refl += refl.rgb * g_mtl[0].reflColor;
 	}
+	wk.lit.refl *= calcViewFresnel(dot(wk.view.dir, wk.geom.nrm), g_mtl[0].reflFrGain, g_mtl[0].reflFrBias);
+	wk.lit.refl = lerp(wk.lit.refl, wk.lit.refl * (1.0 + min(wk.geom.nrm.y, 0.0)), g_mtl[0].reflDownFadeRate);
 	float3 diff = wk.lit.diff * wk.tex.base.rgb;
 	float3 spec = (wk.lit.spec + wk.lit.refl) * wk.tex.spec.rgb;
+	spec *= calcViewFresnel(dot(wk.view.dir, wk.geom.nrm), g_mtl[0].viewFrGain, g_mtl[0].viewFrBias);
 
 	float alpha = mtl.enableAlpha ? wk.tex.base.a*wk.geom.vclr.a : 1.0f;
 
@@ -481,30 +521,7 @@ float4 main(float4 scrPos : SV_POSITION, GEO_INFO geo : TEXCOORD, bool frontFace
 	tgtClr.rgb = diff + spec;
 	wk = calcFog(wk);
 	tgtClr.rgb = tgtClr.rgb*wk.fog.mul + wk.fog.add;
-
-	if (mtl.receiveShadows) {
-		float3 wpos = wk.geom.pos;
-		float3 sdist = -mul(float4(wpos, 1), g_cam[0].view).z;
-		float4 spos = mul(float4(wpos, 1), g_sdw[0].xform);
-		float4 scp = spos.xyzz/spos.w;
-		//if (!(scp.x < 0 || scp.x > 1 || scp.y < 0 || scp.y > 1 || scp.z < 0 || scp.z > 1)) {
-		if (all(scp.xyz>=0) && all(scp.xyz<=1)) {
-			bool scull = g_mtl[0].cullShadows ? dot(wk.geom.nrm, -g_sdw[0].dir) < 0 : false;
-			if (!scull) {
-				float sval = shadowVal(spos);
-				float sdens = g_sdw[0].color.a * g_mtl[0].shadowDensity;
-				sval *= sdens;
-				tgtClr.rgb = lerp(tgtClr.rgb, g_sdw[0].color.rgb, sval);
-				//tgtClr.rgb = float3(scp.x, scp.y, sval);//////////////////
-			}
-		}
-	}
-
-//tgtClr.rgb = wk.lit.diff*0.25;////////////////////////
-//tgtClr.rgb = wk.lit.refl*0.25;////////////////////////
-//tgtClr.rgb = (wk.lit.diff+wk.lit.refl)*0.25;
-//tgtClr.rgb = wk.lit.spec*0.25;////////////////////////
-//tgtClr.rgb = wk.lit.diff*0.5 + wk.lit.spec*0.25;////////////////////////
+	tgtClr.rgb = lerp(tgtClr.rgb, g_sdw[0].color.rgb, wk.sdw.val);
 
 	tgtClr.a = alpha;
 	tgtClr = tgtColor(tgtClr);

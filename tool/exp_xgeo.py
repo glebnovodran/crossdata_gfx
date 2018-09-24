@@ -145,8 +145,8 @@ class MaterialInfo(GroupData):
 
 	def write(self, bw):
 		#print self.shopPath, "@", hex(bw.getPos())
-		bw.writeI16(self.nameId) # +00
-		bw.writeI16(self.pathId) # +02
+		self.xgeo.writeStrId16(bw, self.nameId) # +00
+		self.xgeo.writeStrId16(bw, self.pathId) # +02
 		GroupData.write(self, bw)
 
 class GroupInfo(GroupData):
@@ -160,7 +160,7 @@ class GroupInfo(GroupData):
 	def getName(self): return self.strLst.get(self.nameId)
 
 	def write(self, bw):
-		bw.writeI16(self.nameId) # +00
+		self.xgeo.writeStrId16(bw, self.nameId) # +00
 		bw.writeI16(-1) # +02 empty path
 		GroupData.write(self, bw)
 
@@ -237,7 +237,8 @@ class Polygon:
 			for ptNo in self.pntLst: bw.writeU24(ptNo)
 
 class PntSkin(xh.PntSkin):
-	def __init__(self, pnt, skinAttr):
+	def __init__(self, xgeo, pnt, skinAttr):
+		self.xgeo = xgeo
 		xh.PntSkin.__init__(self, pnt, skinAttr)
 
 	def addNodesToGrp(self, grp):
@@ -252,7 +253,7 @@ class PntSkin(xh.PntSkin):
 
 	def growSkinSphere(self, sph):
 		ptNo = self.pnt.number()
-		pos = self.pnt.position()
+		pos = self.xgeo.getPntPos(ptNo)
 		for idx in self.idx:
 			if idx == sph.nodeId:
 				sph.grow(pos)
@@ -418,6 +419,9 @@ class GeoExporter(xd.BaseExporter):
 		self.bbox = self.geo.boundingBox()
 		self.setNameFromPath(self.sop.parent().path())
 		self.pntNum = len(self.geo.points())
+		self.pnts = []
+		for pnt in self.geo.points():
+			self.pnts.append(pnt.position())
 		self.pols = []
 		self.primTbl = []
 		self.maxVtxPerPol = 0
@@ -488,7 +492,7 @@ class GeoExporter(xd.BaseExporter):
 			self.skinLst = []
 			skinAttr = xh.getSkinAttr(self.geo)
 			for pnt in self.geo.points():
-				skin = PntSkin(pnt, skinAttr)
+				skin = PntSkin(self, pnt, skinAttr)
 				self.maxSkinWgt = max(skin.getWgtNum(), self.maxSkinWgt)
 				self.skinLst.append(skin)
 			#print "max wgt:", self.maxSkinWgt
@@ -644,7 +648,9 @@ class GeoExporter(xd.BaseExporter):
 					self.strLst.add(obj.stringAttribValue(attr))
 
 
-	def getPntPos(self, ptNo): return self.geo.iterPoints()[ptNo].position()
+	#def getPntPos(self, ptNo): return self.geo.iterPoints()[ptNo].position()
+	def getPntPos(self, ptNo): return self.pnts[ptNo]
+
 	def getPntWgtNum(self, ptNo): return self.skinLst[ptNo].getWgtNum()
 	def getPntSkin(self, ptNo): return self.skinLst[ptNo]
 
@@ -678,8 +684,7 @@ class GeoExporter(xd.BaseExporter):
 	def writePntData(self, bw, top):
 		bw.align(0x10)
 		bw.patch(self.patchPos, bw.getPos() - top) # -> pnt
-		for pnt in self.geo.points():
-			bw.writeFV(pnt.position())
+		for pnt in self.pnts: bw.writeFV(pnt)
 
 	def writePolData(self, bw, top):
 		bw.align(0x10)
@@ -743,13 +748,13 @@ class GeoExporter(xd.BaseExporter):
 			val = obj.floatListAttribValue(attr)
 			for x in val: bw.writeF32(x)
 		elif type == hou.attribData.String:
-			bw.writeI32(self.strLst.getIdx(obj.stringAttribValue(attr)))
+			self.writeStrId32(bw, self.strLst.getIdx(obj.stringAttribValue(attr)))
 
 	def writeAttrData(self, bw, top, attrLst):
 		attrPatchTop = bw.getPos()
 		for attr in attrLst:
 			bw.writeU32(0) # +00 -> data
-			bw.writeI32(self.strLst.getIdx(attr.name())) # +04
+			self.writeStrId32(bw, self.strLst.getIdx(attr.name())) # +04
 			bw.writeU16(attr.size()) # +08 len
 			bw.writeU8(getAttrType(attr)) # +0A type
 			bw.writeU8(0) # +0B reserved
@@ -789,7 +794,7 @@ class GeoExporter(xd.BaseExporter):
 		bw.align(0x10)
 		bw.patch(self.patchPos + 0x20, bw.getPos() - top) # -> skin nodes
 		for sph in self.glbSkinSph: sph.write(bw) # spheres
-		for id in self.skinIds: bw.writeI32(id) # names
+		for id in self.skinIds: self.writeStrId32(bw, id) # names
 		bw.patch(self.patchPos + 0x24, bw.getPos() - top) # -> wgt
 		n = self.pntNum
 		offsTop = bw.getPos()

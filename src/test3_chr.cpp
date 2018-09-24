@@ -1,6 +1,8 @@
 #include "crossdata.hpp"
 #include "gex.hpp"
 #include "keyctrl.hpp"
+#include "remote.hpp"
+#include "task.hpp"
 #include "util.hpp"
 #include "obstacle.hpp"
 
@@ -89,7 +91,7 @@ void cCharacter3::create() {
 		if (mpRigMtxW) {
 			mpRigMtxW[i] = mpRig->get_wmtx(i);
 		}
-		if (mpBlendMtxL) {
+		if (mpBlendMtxL && mpRigMtxL) {
 			mpBlendMtxL[i] = mpRigMtxL[i];
 		}
 	}
@@ -110,6 +112,20 @@ void cCharacter3::create() {
 		gexObjSkinInit(pObj, pRestIW);
 		nxCore::mem_free(pRestIW);
 	}
+
+	mpMotEvalJobs = tskJobsAlloc(nnodes);
+	mpMotEvalQueue = tskQueueCreate(nnodes);
+	if (mpMotEvalJobs) {
+		for (int i = 0; i < nnodes; ++i) {
+			mpMotEvalJobs[i].mFunc = mot_node_eval_job;
+			mpMotEvalJobs[i].mpData = this;
+		}
+		if (mpMotEvalQueue) {
+			for (int i = 0; i < nnodes; ++i) {
+				tskQueueAdd(mpMotEvalQueue, &mpMotEvalJobs[i]);
+			}
+		}
+	}	
 
 	//mtl_sort_bias(*pObj, "lashes", 0.2f, 0.0f);
 
@@ -149,6 +165,10 @@ void cCharacter3::destroy() {
 	mpTexN = nullptr;
 	gexObjDestroy(mpObj);
 	mpObj = nullptr;
+	tskQueueDestroy(mpMotEvalQueue);
+	mpMotEvalQueue = nullptr;
+	tskJobsFree(mpMotEvalJobs);
+	mpMotEvalJobs = nullptr;
 	mInitFlg = false;
 }
 
@@ -179,40 +199,90 @@ void cCharacter3::calc_blend() {
 	mBlendCount = nxCalc::max(0.0f, mBlendCount);
 }
 
+/*static*/ void cCharacter3::mot_node_eval_job(TSK_CONTEXT* pCtx) {
+	TSK_JOB* pJob = pCtx->mpJob;
+	cCharacter3* pSelf = (cCharacter3*)pJob->mpData;
+	sxKeyframesData::RigLink* pLink = pSelf->mpMotEvalLink;
+	if (!pLink) return;
+	sxKeyframesData* pKfr = pSelf->mpMotEvalKfr;
+	if (!pKfr) return;
+	pKfr->eval_rig_link_node(pLink, pJob->mId, pSelf->mMotEvalFrame, pSelf->mpRig, pSelf->mpRigMtxL);
+}
+
 float cCharacter3::calc_motion(int motId, float frame, float frameStep) {
 	if (!mInitFlg) return frame;
-	sxKeyframesData* pMot = mMotLib.get_keyframes(motId);
-	if (!pMot) return frame;
+	sxKeyframesData* pKfr = mMotLib.get_keyframes(motId);
+	if (!pKfr) return frame;
 	sxKeyframesData::RigLink* pLink = mMotLib.get_riglink(motId);
 	if (!pLink) return frame;
-	pMot->eval_rig_link(pLink, frame, mpRig, mpRigMtxL);
+	mpMotEvalKfr = pKfr;
+	mpMotEvalLink = pLink;
+	mMotEvalFrame = frame;
+	TSK_BRIGADE* pBgd = get_brigade();
+	bool tskFlg = pBgd && mpMotEvalJobs && mpMotEvalQueue;
+	int njobs = pLink->mNodeNum;
+	int nwrk = tskBrigadeGetNumWorkers(pBgd);
+	if (tskFlg) {
+		if (nwrk > 3) {
+			nwrk = (int)::floorf((float)njobs / 7);
+		}
+		tskBrigadeSetActiveWorkers(pBgd, nwrk);
+		tskQueueAdjust(mpMotEvalQueue, njobs);
+		tskBrigadeExec(pBgd, mpMotEvalQueue);
+	} else {
+		pKfr->eval_rig_link(pLink, frame, mpRig, mpRigMtxL);
+	}
+
+	int moveGrpId = -1;
+	sxKeyframesData::RigLink::Val* pMoveVal = nullptr;
+	cxVec prevPos;
+	float prevFrame = nxCalc::max(frame - frameStep, 0.0f);
 	if (mpRig->ck_node_idx(mMovementNodeId)) {
 		mMotVelFrame = frame;
 		int16_t* pMotToRig = pLink->get_rig_map();
 		if (pMotToRig) {
-			int moveGrpId = pMotToRig[mMovementNodeId];
+			moveGrpId = pMotToRig[mMovementNodeId];
 			if (moveGrpId >= 0) {
-				sxKeyframesData::RigLink::Val* pVal = pLink->mNodes[moveGrpId].get_pos_val();
-				cxVec vel = pVal->get_vec();
+				pMoveVal = pLink->mNodes[moveGrpId].get_pos_val();
 				if (frame > 0.0f) {
-					float prevFrame = nxCalc::max(frame - frameStep, 0.0f);
-					cxVec prevPos;
 					for (int i = 0; i < 3; ++i) {
-						sxKeyframesData::FCurve fcv = pMot->get_fcv(pVal->fcvId[i]);
+						sxKeyframesData::FCurve fcv = pKfr->get_fcv(pMoveVal->fcvId[i]);
 						prevPos.set_at(i, fcv.is_valid() ? fcv.eval(prevFrame) : 0.0f);
 					}
-					vel -= prevPos;
-				} else {
-					vel *= frameStep;
 				}
-				mMotVel = vel;
 			}
 		}
 	}
+
+	if (tskFlg) {
+		tskBrigadeWait(pBgd);
+	}
+
+	if (pMoveVal) {
+		cxVec vel = pMoveVal->get_vec();
+		if (frame > 0.0f) {
+			vel -= prevPos;
+		} else {
+			vel *= frameStep;
+		}
+		mMotVel = vel;
+	}
+
 	frame += frameStep;
-	if (frame >= pMot->get_max_fno()) {
+	if (frame >= pKfr->get_max_fno()) {
 		frame = 0.0f;
 	}
+
+	if (0 && pBgd) {
+		::printf("%d/%d -> ", njobs, nwrk);
+		int nwrk = tskBrigadeGetNumActiveWorkers(pBgd);
+		for (int i = 0; i < nwrk; ++i) {
+			TSK_CONTEXT* pCtx = tskBrigadeGetContext(pBgd, i);
+			::printf("%d:%d ", i, pCtx->mJobsDone);
+		}
+		::printf("\n");
+	}
+
 	return frame;
 }
 
@@ -252,7 +322,18 @@ void cCharacter3::calc_world() {
 void cCharacter3::dance_loop_ctrl() {
 	KEY_CTRL* pKeys = get_ctrl_keys();
 	if (!pKeys) return;
-	if (keyCkTrg(pKeys, D_KEY_UP)) {
+	bool flgU = keyCkTrg(pKeys, D_KEY_UP);
+	bool flgD = keyCkTrg(pKeys, D_KEY_DOWN);
+	bool flgL = keyCkTrg(pKeys, D_KEY_LEFT);
+	bool flgR = keyCkTrg(pKeys, D_KEY_RIGHT);
+	bool useTDJoy = true;
+	if (useTDJoy) {
+		flgU |= (get_td_joy()->b4 != 0);
+		flgD |= (get_td_joy()->b1 != 0);
+		flgL |= (get_td_joy()->b3 != 0);
+		flgR |= (get_td_joy()->b2 != 0);
+	}
+	if (flgU) {
 		mStateMain = STATE::DANCE_ACT;
 		mStateSub = 0;
 		if (keyCkNow(pKeys, D_KEY_L1)) {
@@ -291,7 +372,7 @@ void cCharacter3::dance_loop_ctrl() {
 			mMotFrame = 0.0f;
 			blend_init(actBlendToTime);
 		}
-	} else if (keyCkTrg(pKeys, D_KEY_DOWN)) {
+	} else if (flgD) {
 		mStateMain = STATE::DANCE_ACT;
 		mStateSub = 0;
 		int actRand = ::rand() & 3;
@@ -317,7 +398,7 @@ void cCharacter3::dance_loop_ctrl() {
 		mStateParams[1] = actBlendBackTime;
 		mMotFrame = 0.0f;
 		blend_init(actBlendToTime);
-	} else if (keyCkTrg(pKeys, D_KEY_LEFT)) {
+	} else if (flgL) {
 		mStateMain = STATE::DANCE_ACT;
 		mStateSub = 0;
 		int actRand = ::rand() & 3;
@@ -343,7 +424,7 @@ void cCharacter3::dance_loop_ctrl() {
 		mStateParams[1] = actBlendBackTime;
 		mMotFrame = 0.0f;
 		blend_init(actBlendToTime);
-	} else if (keyCkTrg(pKeys, D_KEY_RIGHT)) {
+	} else if (flgR) {
 		mStateMain = STATE::DANCE_ACT;
 		mStateSub = 0;
 		int actRand = ::rand() & 3;
@@ -612,7 +693,7 @@ bool cCharacter3::prop_adj() {
 }
 
 void cCharacter3::update() {
-	static StateFunc danceCtrlTbl[] = {
+	static StateFunc ctrlTbl[] = {
 		&cCharacter3::dance_loop_ctrl,
 		&cCharacter3::dance_act_ctrl,
 		&cCharacter3::idle_ctrl,
@@ -620,7 +701,7 @@ void cCharacter3::update() {
 		&cCharacter3::walk_ctrl,
 		&cCharacter3::run_ctrl
 	};
-	static StateFunc danceExecTbl[] = {
+	static StateFunc execTbl[] = {
 		&cCharacter3::dance_loop_exec,
 		&cCharacter3::dance_act_exec,
 		&cCharacter3::idle_exec,
@@ -628,8 +709,8 @@ void cCharacter3::update() {
 		&cCharacter3::walk_exec,
 		&cCharacter3::run_exec
 	};
-	(this->*danceCtrlTbl[(int)mStateMain])();
-	(this->*danceExecTbl[(int)mStateMain])();
+	(this->*ctrlTbl[(int)mStateMain])();
+	(this->*execTbl[(int)mStateMain])();
 
 	bool adjFlg = false;
 	adjFlg |= prop_adj();

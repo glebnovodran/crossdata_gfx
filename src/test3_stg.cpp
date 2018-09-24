@@ -1,6 +1,7 @@
 #include "crossdata.hpp"
 #include "gex.hpp"
 #include "keyctrl.hpp"
+#include "remote.hpp"
 #include "util.hpp"
 
 #include "test3_chr.hpp"
@@ -52,7 +53,9 @@ void cStage3::create() {
 		}
 
 		if (mpFenceObj) {
-			init_materials(*mpFenceObj, *pMtlVals);
+			if (pMtlVals) {
+				init_materials(*mpFenceObj, *pMtlVals);
+			}
 			obj_shadow_mode(*mpFenceObj, true, true); // caster + receiver
 			obj_shadow_params(*mpFenceObj, 1.0f, 200.0f, false);
 
