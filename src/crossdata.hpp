@@ -196,18 +196,37 @@ template<typename T> inline T max(T x, T y, T z) { return max(x, max(y, z)); }
 template<typename T> inline T max(T x, T y, T z, T w) { return max(x, max(y, z, w)); }
 
 template<typename T> inline T clamp(T x, T lo, T hi) { return max(min(x, hi), lo); }
+template<typename T> inline T saturate(T x) { return clamp(x, T(0), T(1)); }
 
 template<typename T> inline T sq(T x) { return x*x; }
 template<typename T> inline T cb(T x) { return x*x*x; }
 
+template<typename T> inline T div0(T x, T y) { return y != T(0) ? x / y : T(0); }
+template<typename T> inline T rcp0(T x) { return div0(T(1), x); }
+
+template<typename T> inline T tfabs(T x) { return T(::fabs((double)x)); }
+inline float tfabs(float x) { return ::fabsf(x); }
+
+template<typename T> inline T tsqrt(T x) { return T(::sqrt((double)x)); }
+inline float tsqrt(float x) { return ::sqrtf(x); }
+
+template<typename T> inline T tsin(T x) { return T(::sin((double)x)); }
+inline float tsin(float x) { return ::sinf(x); }
+
+template<typename T> inline T tcos(T x) { return T(::cos((double)x)); }
+inline float tcos(float x) { return ::cosf(x); }
+
+template<typename T> inline T tpow(T x, T y) { return T(::pow((double)x, (double)y)); }
+inline float tpow(float x, float y) { return ::powf(x, y); }
+
 template<typename T> T ipow(T x, int n) {
-	float wx = x;
+	T wx = x;
 	int wn = n;
 	if (n < 0) {
 		wx = rcp0(x);
 		wn = -n;
 	}
-	float res = 1.0f;
+	T res = T(1);
 	do {
 		if ((wn & 1) != 0) res *= wx;
 		wx *= wx;
@@ -216,16 +235,16 @@ template<typename T> T ipow(T x, int n) {
 	return res;
 }
 
-inline float saturate(float x) { return clamp(x, 0.0f, 1.0f); }
-
-inline float div0(float x, float y) { return y != 0.0f ? x / y : 0.0f; }
-
-inline float rcp0(float x) { return div0(1.0f, x); }
-
 inline float hypot(float x, float y) {
 	float m = max(::fabsf(x), ::fabsf(y));
 	float im = rcp0(m);
 	return ::sqrtf(sq(x*im) + sq(y*im)) * m;
+}
+
+inline double hypot(double x, double y) {
+	double m = max(::fabs(x), ::fabs(y));
+	double im = rcp0(m);
+	return ::sqrt(sq(x*im) + sq(y*im)) * m;
 }
 
 inline float cb_root(float x) {
@@ -290,6 +309,11 @@ template<typename FN> float panorama_scan(FN& fn, int w, int h) {
 	return (XD_PI * 4.0f) * rcp0(sum);
 }
 
+inline bool is_even(int32_t x) { return (x & 1) == 0; }
+inline bool is_odd(int32_t x) { return (x & 1) != 0; }
+bool is_prime(int32_t x);
+int32_t prime(int32_t x);
+
 } // nxCalc
 
 namespace nxLA {
@@ -304,6 +328,11 @@ template<typename DST_T, typename SRC_T> inline void mtx_cpy(DST_T* pDst, const 
 	for (int i = 0; i < n; ++i) {
 		pDst[i] = DST_T(pSrc[i]);
 	}
+}
+
+template<typename T> inline T* vec_alloc(int N) {
+	int a = nxCalc::min(int(sizeof(T) * 4), 0x10);
+	return reinterpret_cast<T*>(nxCore::mem_alloc(N * sizeof(T), XD_FOURCC('L', 'A', 'v', 'c'), a));
 }
 
 template<typename DST_T, typename SRC_T> inline void vec_cpy(DST_T* pDst, const SRC_T* pSrc, int N) {
@@ -379,18 +408,206 @@ inline void mul_mv(DST_VEC_T* pDstVec, const MTX_T* pMtx, const SRC_VEC_T* pSrcV
 #endif
 }
 
-template<typename T> inline void identity(T* pMtx, int N) {
-	for (int i = 0; i < N * N; ++i) {
-		pMtx[i] = 0;
-	}
+template<typename DST_T, typename SRC_L_T, typename SRC_R_T>
+inline void mul_md(DST_T* pDst, const SRC_L_T* pSrc, const SRC_R_T* pDiag, const int M, const int N) {
 	for (int i = 0; i < N; ++i) {
-		pMtx[(i * N) + i] = 1;
+		int idx = i;
+		SRC_R_T d = pDiag[i];
+		for (int j = 0; j < M; ++j) {
+			pDst[idx] = DST_T(pSrc[idx] * d);
+			idx += N;
+		}
+	}
+}
+
+template<typename DST_T, typename SRC_L_T, typename SRC_R_T>
+inline void mul_dm(DST_T* pDst, const SRC_L_T* pDiag, const SRC_R_T* pSrc, const int M, const int N) {
+	for (int i = 0; i < M; ++i) {
+		int idx = i*N;
+		SRC_R_T d = pDiag[i];
+		for (int j = 0; j < N; ++j) {
+			pDst[idx + j] = DST_T(pSrc[idx + j] * d);
+		}
+	}
+}
+
+template<typename T, typename ACC_T = T>
+XD_FORCEINLINE
+ACC_T dot_col_col(const T* pMtx, const int N, const int icol1, const int icol2, const int iorg, const int iend) {
+	ACC_T s = ACC_T(0);
+	const T* pOrg = pMtx + (iorg*N);
+	const T* pCol1 = pOrg + icol1;
+	const T* pCol2 = pOrg + icol2;
+	for (int i = iorg; i <= iend; ++i) {
+		ACC_T a = ACC_T(*pCol1);
+		ACC_T b = ACC_T(*pCol2);
+		s += a * b;
+		pCol1 += N;
+		pCol2 += N;
+	}
+	return s;
+}
+
+template<typename T>
+XD_FORCEINLINE
+void zero_col(T* pMtx, const int N, const int icol, const int iorg, const int iend) {
+	T* p = pMtx + (iorg*N) + icol;
+	for (int i = iorg; i <= iend; ++i) {
+		*p = T(0);
+		p += N;
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void neg_col(T* pMtx, const int N, const int icol, const int iorg, const int iend) {
+	T* p = pMtx + (iorg*N) + icol;
+	for (int i = iorg; i <= iend; ++i) {
+		T x = *p;
+		*p = -x;
+		p += N;
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void scl_col(T* pMtx, const int N, const int icol, const int iorg, const int iend, const T s) {
+	T* p = pMtx + (iorg*N) + icol;
+	for (int i = iorg; i <= iend; ++i) {
+		*p *= s;
+		p += N;
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void elim_col(T* pMtx, const int N, const int idst, const int isrc, const int iorg, const int iend, const T s) {
+	T* pOrg = pMtx + (iorg*N);
+	T* pDst = pOrg + idst;
+	T* pSrc = pOrg + isrc;
+	for (int i = iorg; i <= iend; ++i) {
+		*pDst += *pSrc * s;
+		pDst += N;
+		pSrc += N;
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void rot_col(T* pMtx, const int N, const int icol1, const int icol2, const int iorg, const int iend, const T s, const T c) {
+	T* pOrg = pMtx + (iorg*N);
+	T* pCol1 = pOrg + icol1;
+	T* pCol2 = pOrg + icol2;
+	for (int i = iorg; i <= iend; ++i) {
+		T x = *pCol1;
+		T y = *pCol2;
+		*pCol1 = x*c + y*s;
+		*pCol2 = y*c - x*s;
+		pCol1 += N;
+		pCol2 += N;
 	}
 }
 
 template<typename T>
 inline
-bool transpose(T* pMtx, int M, int N, uint32_t* pFlgWk = nullptr) {
+void swap_cols(T* pMtx, const int N, const int icol1, const int icol2, const int iorg, const int iend) {
+	T* pOrg = pMtx + (iorg*N);
+	T* pCol1 = pOrg + icol1;
+	T* pCol2 = pOrg + icol2;
+	for (int i = iorg; i <= iend; ++i) {
+		T t = *pCol1;
+		*pCol1 = *pCol2;
+		*pCol2 = t;
+		pCol1 += N;
+		pCol2 += N;
+	}
+}
+
+template<typename T, typename ACC_T = T>
+XD_FORCEINLINE
+ACC_T dot_row_row(const T* pMtx, const int N, const int irow1, const int irow2, const int iorg, const int iend) {
+	ACC_T s = ACC_T(0);
+	const T* pRow1 = pMtx + (irow1*N) + iorg;
+	const T* pRow2 = pMtx + (irow2*N) + iorg;
+	for (int i = iorg; i <= iend; ++i) {
+		ACC_T a = ACC_T(*pRow1);
+		ACC_T b = ACC_T(*pRow2);
+		s += a * b;
+		++pRow1;
+		++pRow2;
+	}
+	return s;
+}
+
+template<typename T>
+XD_FORCEINLINE
+void zero_row(T* pMtx, const int N, const int irow, const int iorg, const int iend) {
+	T* p = pMtx + (irow*N) + iorg;
+	for (int i = iorg; i <= iend; ++i) {
+		*p++ = T(0);
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void neg_row(T* pMtx, const int N, const int irow, const int iorg, const int iend) {
+	T* p = pMtx + (irow*N) + iorg;
+	for (int i = iorg; i <= iend; ++i) {
+		T x = *p;
+		*p = -x;
+		++p;
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void scl_row(T* pMtx, const int N, const int irow, const int iorg, const int iend, const T s) {
+	T* p = pMtx + (irow*N) + iorg;
+	for (int i = iorg; i <= iend; ++i) {
+		*p++ *= s;
+	}
+}
+
+template<typename T>
+XD_FORCEINLINE
+void elim_row(T* pMtx, const int N, const int idst, const int isrc, const int iorg, const int iend, const T s) {
+	T* pDst = pMtx + (idst*N) + iorg;
+	T* pSrc = pMtx + (isrc*N) + iorg;
+	for (int i = iorg; i <= iend; ++i) {
+		*pDst += *pSrc * s;
+		++pDst;
+		++pSrc;
+	}
+}
+
+template<typename T, typename ACC_T = T>
+XD_FORCEINLINE
+ACC_T dot_row_col(const T* pRowMtx, const T* pColMtx, const int N, const int irow, const int icol, const int iorg, const int iend) {
+	ACC_T s = ACC_T(0);
+	const T* pRow = pRowMtx + (irow*N) + iorg;
+	const T* pCol = pColMtx + (iorg*N) + icol;
+	for (int i = iorg; i <= iend; ++i) {
+		ACC_T a = ACC_T(*pRow);
+		ACC_T b = ACC_T(*pCol);
+		s += a * b;
+		++pRow;
+		pCol += N;
+	}
+	return s;
+}
+
+template<typename T> inline void identity(T* pMtx, const int N) {
+	for (int i = 0; i < N * N; ++i) {
+		pMtx[i] = T(0);
+	}
+	for (int i = 0; i < N; ++i) {
+		pMtx[(i * N) + i] = T(1);
+	}
+}
+
+template<typename T>
+inline
+bool transpose(T* pMtx, const int M, const int N, uint32_t* pFlgWk = nullptr) {
 	if (M == N) {
 		for (int i = 0; i < N - 1; ++i) {
 			for (int j = i + 1; j < N; ++j) {
@@ -437,7 +654,7 @@ bool transpose(T* pMtx, int M, int N, uint32_t* pFlgWk = nullptr) {
 
 template<typename T>
 XD_FORCEINLINE
-bool inv_gj(T* pMtx, int N, int* pWk /* [N*3] */) {
+bool inv_gj(T* pMtx, const int N, int* pWk /* [N*3] */) {
 	int* pPiv = pWk;
 	int* pCol = pWk + N;
 	int* pRow = pWk + N*2;
@@ -514,7 +731,7 @@ bool inv_gj(T* pMtx, int N, int* pWk /* [N*3] */) {
 
 template<typename T>
 XD_FORCEINLINE
-bool lu_decomp(T* pMtx, int N, T* pWk /* [N] */, int* pIdx /* [N] */, T* pDetSgn = nullptr) {
+bool lu_decomp(T* pMtx, const int N, T* pWk /* [N] */, int* pIdx /* [N] */, T* pDetSgn = nullptr) {
 	T dsgn = 1;
 	T* pScl = pWk;
 	for (int i = 0; i < N; ++i) {
@@ -584,7 +801,7 @@ bool lu_decomp(T* pMtx, int N, T* pWk /* [N] */, int* pIdx /* [N] */, T* pDetSgn
 
 template<typename T>
 XD_FORCEINLINE
-void lu_solve(T* pAns, const T* pLU, const T* pRHS, const int* pIdx, int N) {
+void lu_solve(T* pAns, const T* pLU, const T* pRHS, const int* pIdx, const int N) {
 	if (pAns != pRHS) {
 		for (int i = 0; i < N; ++i) {
 			pAns[i] = pRHS[i];
@@ -620,9 +837,9 @@ void lu_solve(T* pAns, const T* pLU, const T* pRHS, const int* pIdx, int N) {
 
 template<typename T>
 inline
-bool symm_ldlt_decomp(T* pMtx, int N, T* pDet /* [N] */, int* pIdx /* [N] */) {
+bool symm_ldlt_decomp(T* pMtx, const int N, T* pDet /* [N] */, int* pIdx /* [N] */) {
 	const T zthr = T(1.0e-16);
-	const T aprm = T(1 + ::sqrt(17.0)) / 8;
+	const T aprm = T((1.0 + ::sqrt(17.0)) / 8.0);
 	int eposi = 0;
 	int enega = 0;
 	pIdx[N - 1] = N - 1;
@@ -635,6 +852,7 @@ bool symm_ldlt_decomp(T* pMtx, int N, T* pDet /* [N] */, int* pIdx /* [N] */) {
 		if (aii < 0) aii = -aii;
 		pIdx[i] = i;
 		T lambda = pMtx[ri + i1];
+		if (lambda < 0) lambda = -lambda;
 		int j = i1;
 		for (int k = i2; k < N; ++k) {
 			T aik = pMtx[ri + k];
@@ -777,7 +995,7 @@ bool symm_ldlt_decomp(T* pMtx, int N, T* pDet /* [N] */, int* pIdx /* [N] */) {
 
 template<typename T>
 inline
-void symm_ldlt_solve(T* pAns, const T* pMtx, const T* pRHS, const T* pDet /* [N] */, const int* pIdx /* [N] */, int N) {
+void symm_ldlt_solve(T* pAns, const T* pMtx, const T* pRHS, const T* pDet /* [N] */, const int* pIdx /* [N] */, const int N) {
 	if (pAns != pRHS) {
 		for (int i = 0; i < N; ++i) {
 			pAns[i] = pRHS[i];
@@ -834,6 +1052,297 @@ void symm_ldlt_solve(T* pAns, const T* pMtx, const T* pRHS, const T* pDet /* [N]
 		pAns[idx] = t;
 		i = ii - 1;
 	}
+}
+
+template<typename T>
+inline
+bool sv_decomp(T* pU, T* pS, T* pV, T* pWk, const T* pA, const int M, const int N, const bool uflg = true, const bool sort = true, const int niter = 200) {
+	if (pU != pA) {
+		mtx_cpy(pU, pA, M, N);
+	}
+
+	T g = T(0);
+	T scl = T(0);
+	T nrm = T(0);
+	T s, c, f, h;
+	T* pCell;
+	for (int i = 0; i < N; ++i) {
+		int iorg = i;
+		int iend = M - 1;
+		pWk[i] = g * scl;
+		g = T(0);
+		s = T(0);
+		scl = T(0);
+		if (i < M) {
+			pCell = pU + (iorg * N) + i;
+			for (int j = iorg; j <= iend; ++j) {
+				scl += nxCalc::tfabs(*pCell);
+				pCell += N;
+			}
+		}
+		if (scl != T(0)) {
+			scl_col(pU, N, i, iorg, iend, T(1) / scl);
+			s = dot_col_col(pU, N, i, i, iorg, iend);
+			f = pU[i*N + i];
+			g = nxCalc::tsqrt(s);
+			if (f > T(0)) g = -g;
+			h = f*g - s;
+			h = T(1) / h;
+			pU[i*N + i] -= g;
+			for (int j = i + 1; j < N; ++j) {
+				s = dot_col_col(pU, N, i, j, iorg, iend);
+				elim_col(pU, N, j, i, iorg, iend, s * h);
+			}
+			scl_col(pU, N, i, iorg, iend, scl);
+		}
+		pS[i] = g * scl;
+		g = T(0);
+		s = T(0);
+		iorg = i + 1;
+		iend = N - 1;
+		scl = T(0);
+		if (i < M && i != N - 1) {
+			pCell = pU + (i*N) + iorg;
+			for (int j = iorg; j <= iend; ++j) {
+				scl += nxCalc::tfabs(*pCell);
+				++pCell;
+			}
+		}
+		if (scl != T(0)) {
+			scl_row(pU, N, i, iorg, iend, T(1) / scl);
+			s = dot_row_row(pU, N, i, i, iorg, iend);
+			f = pU[i*N + iorg];
+			g = nxCalc::tsqrt(s);
+			if (f > T(0)) g = -g;
+			h = f*g - s;
+			pU[i*N + iorg] -= g;
+			s = T(1) / h;
+			pCell = pU + (i*N);
+			for (int j = iorg; j <= iend; ++j) {
+				pWk[j] = pCell[j] * s;
+			}
+			for (int j = i + 1; j < M; ++j) {
+				s = dot_row_row(pU, N, i, j, iorg, iend);
+				pCell = pU + (j*N) + iorg;
+				for (int k = iorg; k <= iend; ++k) {
+					*pCell += pWk[k] * s;
+					++pCell;
+				}
+			}
+			scl_row(pU, N, i, iorg, iend, scl);
+		}
+		s = nxCalc::tfabs(pS[i]) + nxCalc::tfabs(pWk[i]);
+		nrm = nxCalc::max(nrm, s);
+	}
+
+	if (pV) {
+		for (int i = N; --i >= 0;) {
+			if (i < N - 1) {
+				if (g) {
+					for (int j = i + 1; j < N; ++j) {
+						pV[j*N + i] = pU[i*N + j] / pU[i*N + i + 1];
+					}
+					scl_col(pV, N, i, i + 1, N - 1, T(1) / g);
+					for (int j = i + 1; j < N; ++j) {
+						s = dot_row_col(pU, pV, N, i, j, i + 1, N - 1);
+						elim_col(pV, N, j, i, i + 1, N - 1, s);
+					}
+				}
+				zero_row(pV, N, i, i + 1, N - 1);
+				zero_col(pV, N, i, i + 1, N - 1);
+			}
+			pV[i*N + i] = T(1);
+			g = pWk[i];
+		}
+	}
+
+	if (uflg) {
+		for (int i = nxCalc::min(M, N); --i >= 0;) {
+			if (i < N - 1) {
+				zero_row(pU, N, i, i + 1, N - 1);
+			}
+			g = pS[i];
+			if (g) {
+				g = T(1) / g;
+				for (int j = i + 1; j < N; ++j) {
+					s = dot_col_col(pU, N, i, j, i + 1, M - 1);
+					s /= pU[i*N + i];
+					elim_col(pU, N, j, i, i, M - 1, s * g);
+				}
+				scl_col(pU, N, i, i, M - 1, g);
+			} else {
+				zero_col(pU, N, i, i, M - 1);
+			}
+			pU[i*N + i] += T(1);
+		}
+	}
+
+	for (int k = N; --k >= 0;) {
+		for (int itr = 0; itr < niter; ++itr) {
+			int idx;
+			bool flg = true;
+			for (int i = k; i >= 0; --i) {
+				idx = i;
+				if (i == 0) {
+					flg = false;
+					break;
+				}
+				if (nxCalc::tfabs(pWk[i]) + nrm == nrm) {
+					flg = false;
+					break;
+				}
+				if (nxCalc::tfabs(pS[i - 1]) + nrm == nrm) {
+					break;
+				}
+			}
+			if (flg) {
+				s = T(1);
+				c = T(0);
+				for (int i = idx; i <= k; ++i) {
+					f = pWk[i] * s;
+					pWk[i] *= c;
+					if (nxCalc::tfabs(f) + nrm == nrm) {
+						break;
+					}
+					g = pS[i];
+					h = nxCalc::hypot(f, g);
+					pS[i] = h;
+					h = T(1) / h;
+					c = g * h;
+					s = -f * h;
+					if (uflg) {
+						rot_col(pU, N, idx - 1, i, 0, M - 1, s, c);
+					}
+				}
+			}
+			T z = pS[k];
+			if (idx == k) {
+				if (z < T(0)) {
+					pS[k] = -z;
+					if (pV) {
+						neg_col(pV, N, k, 0, N - 1);
+					}
+				}
+				break;
+			}
+			if (itr == niter - 1) {
+				return false;
+			}
+			g = pWk[k - 1];
+			h = pWk[k];
+			f = (g - h) * (g + h);
+			T x = pS[idx];
+			T y = pS[k - 1];
+			f += (y - z) * (y + z);
+			f /= T(2) * h * y;
+			g = nxCalc::hypot(f, T(1));
+			f += f >= 0 ? g : -g;
+			f = y / f;
+			f -= h;
+			f *= h;
+			f += (x - z) * (x + z);
+			f /= x;
+
+			s = T(1);
+			c = T(1);
+			for (int i = idx; i < k; ++i) {
+				g = pWk[i + 1];
+				y = pS[i + 1];
+				h = g * s;
+				g *= c;
+				z = nxCalc::hypot(f, h);
+				pWk[i] = z;
+				T iz = T(1) / z;
+				c = f * iz;
+				s = h * iz;
+				f = x*c + g*s;
+				g = g*c - x*s;
+				h = y * s;
+				y *= c;
+				if (pV) {
+					rot_col(pV, N, i, i + 1, 0, N - 1, s, c);
+				}
+				z = nxCalc::hypot(f, h);
+				pS[i] = z;
+				if (z) {
+					iz = T(1) / z;
+					c = f * iz;
+					s = h * iz;
+				}
+				f = g*c + y*s;
+				x = y*c - g*s;
+				if (uflg) {
+					rot_col(pU, N, i, i + 1, 0, M - 1, s, c);
+				}
+			}
+			pWk[idx] = T(0);
+			pWk[k] = f;
+			pS[k] = x;
+		}
+	}
+
+	if (uflg && pV) {
+		for (int i = 0; i < N; ++i) {
+			int nc = 0;
+			pCell = pU + i;
+			for (int j = 0; j < M; ++j) {
+				nc += *pCell < T(0) ? 1 : 0;
+				pCell += N;
+			}
+			pCell = pV + i;
+			for (int j = 0; j < N; ++j) {
+				nc += *pCell < T(0) ? 1 : 0;
+				pCell += N;
+			}
+			if (nc > (M + N) / 2) {
+				neg_col(pU, N, i, 0, M - 1);
+				neg_col(pV, N, i, 0, N - 1);
+			}
+		}
+	}
+
+	if (sort) {
+		int left = 0;
+		int right = N - 1;
+		int start = left;
+		do {
+			if (left < right) {
+				for (int i = left; i < right; ++i) {
+					if (pS[i] < pS[i + 1]) {
+						start = i;
+						T t = pS[i];
+						pS[i] = pS[i + 1];
+						pS[i + 1] = t;
+						if (uflg) {
+							swap_cols(pU, N, i, i + 1, 0, M - 1);
+						}
+						if (pV) {
+							swap_cols(pV, N, i, i + 1, 0, N - 1);
+						}
+					}
+				}
+			}
+			right = start;
+			if (left < start) {
+				for (int i = start; left < i; --i) {
+					if (pS[i - 1] < pS[i]) {
+						T t = pS[i];
+						pS[i] = pS[i - 1];
+						pS[i - 1] = t;
+						if (uflg) {
+							swap_cols(pU, N, i, i - 1, 0, M - 1);
+						}
+						if (pV) {
+							swap_cols(pV, N, i, i - 1, 0, N - 1);
+						}
+					}
+				}
+			}
+			left = start;
+		} while (start < right);
+	}
+
+	return true;
 }
 
 } // nxLA
@@ -1858,6 +2367,16 @@ inline cxVec seg_pnt_closest(const cxVec& sp0, const cxVec& sp1, const cxVec& pn
 
 float seg_seg_dist2(const cxVec& s0p0, const cxVec& s0p1, const cxVec& s1p0, const cxVec& s1p1, cxVec* pBridgeP0 = nullptr, cxVec* pBridgeP1 = nullptr);
 
+inline bool pnt_in_tri(const cxVec& pos, const cxVec& v0, const cxVec& v1, const cxVec& v2) {
+	cxVec a = v0 - pos;
+	cxVec b = v1 - pos;
+	cxVec c = v2 - pos;
+	cxVec u = nxVec::cross(b, c);
+	if (u.dot(nxVec::cross(c, a)) < 0.0f) return false;
+	if (u.dot(nxVec::cross(a, b)) < 0.0f) return false;
+	return true;
+}
+
 inline bool pnt_in_aabb(const cxVec& pos, const cxVec& min, const cxVec& max) {
 	if (pos.x < min.x || pos.x > max.x) return false;
 	if (pos.y < min.y || pos.y > max.y) return false;
@@ -2199,6 +2718,27 @@ public:
 		b += c.b;
 	}
 
+	void to_nonlinear(float gamma = 2.2f) {
+		if (gamma <= 0.0f || gamma == 1.0f) return;
+		float igamma = 1.0f / gamma;
+		for (int i = 0; i < 3; ++i) {
+			if (ch[i] <= 0.0f) {
+				ch[i] = 0.0f;
+			} else {
+				ch[i] = ::powf(ch[i], igamma);
+			}
+		}
+	}
+
+	void to_linear(float gamma = 2.2f) {
+		if (gamma <= 0.0f || gamma == 1.0f) return;
+		for (int i = 0; i < 3; ++i) {
+			if (ch[i] > 0.0f) {
+				ch[i] = ::powf(ch[i], gamma);
+			}
+		}
+	}
+
 	cxVec YCgCo() const;
 	void from_YCgCo(const cxVec& ygo);
 	cxVec TMI() const;
@@ -2222,6 +2762,8 @@ public:
 	void decode_rgba8(uint32_t rgba);
 	uint32_t encode_bgra8() const;
 	void decode_bgra8(uint32_t bgra);
+	uint16_t encode_bgr565() const;
+	void decode_bgr565(uint16_t bgr);
 };
 
 namespace nxColor {
@@ -2631,6 +3173,8 @@ struct sxGeometryData : public sxData {
 		bool is_planar(float eps = 1.0e-6f) const;
 		bool intersect(const cxLineSeg& seg, cxVec* pHitPos = nullptr, cxVec* pHitNrm = nullptr) const;
 		bool contains_xz(const cxVec& pos) const;
+		int triangulate(int* pVtxLst, void* pWk = nullptr) const;
+		int tri_count() const;
 	};
 
 	struct GrpInfo {
@@ -2749,7 +3293,7 @@ struct sxGeometryData : public sxData {
 
 		DisplayList() : mpGeo(nullptr), mpData(nullptr) {}
 
-		void create(const sxGeometryData& geo, const char* pBatGrpPrefix = nullptr);
+		void create(const sxGeometryData& geo, const char* pBatGrpPrefix = nullptr, bool triangulate = true);
 
 		friend struct sxGeometryData;
 
@@ -2853,6 +3397,7 @@ struct sxGeometryData : public sxData {
 	cxAABB calc_world_bbox(cxMtx* pMtxW, int* pIdxMap = nullptr) const;
 	void calc_tangents(cxVec* pTng, bool flip = false, const char* pAttrName = nullptr) const;
 	cxVec* calc_tangents(bool flip = false, const char* pAttrName = nullptr) const;
+	void* alloc_triangulation_wk() const;
 
 	static const uint32_t KIND = XD_FOURCC('X', 'G', 'E', 'O');
 };
@@ -2912,18 +3457,22 @@ struct sxDDSHead {
 namespace nxTexture {
 
 sxDDSHead* alloc_dds128(uint32_t w, uint32_t h, uint32_t* pSize = nullptr);
-void save_dds128(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h);
-void save_dds64(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h);
-void save_dds32_rgbe(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h);
-void save_dds32_bgre(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h);
-void save_dds32_rgbi(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h);
-void save_dds32_bgri(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h);
-void save_dds32_rgba8(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h, float gamma = 2.2f);
-void save_dds32_bgra8(const char* pPath, cxColor* pClr, uint32_t w, uint32_t h, float gamma = 2.2f);
+void save_dds128(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h);
+void save_dds64(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h);
+void save_dds32_rgbe(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h);
+void save_dds32_bgre(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h);
+void save_dds32_rgbi(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h);
+void save_dds32_bgri(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h);
+void save_dds32_rgba8(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h, float gamma = 2.2f);
+void save_dds32_bgra8(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h, float gamma = 2.2f);
 
 cxColor* decode_dds(sxDDSHead* pDDS, uint32_t* pWidth, uint32_t* pHeight, float gamma = 2.2f);
 
+void save_sgi(const char* pPath, const cxColor* pClr, uint32_t w, uint32_t h, float gamma = 2.2f);
+
 void calc_resample_wgts(int oldRes, int newRes, xt_float4* pWgt, int16_t* pOrg);
+cxColor* upscale(const cxColor* pSrc, int srcW, int srcH, int xscl, int yscl, bool filt = true, cxColor* pDstBuff = nullptr, void* pWrkMem = nullptr, bool cneg = true);
+size_t calc_upscale_work_size(int srcW, int srcH, int xscl, int yscl);
 
 } // nxTexture
 
@@ -3351,6 +3900,725 @@ struct sxFileCatalogue : public sxData {
 	int find_name_idx(const char* pName) const;
 
 	static const uint32_t KIND = XD_FOURCC('F', 'C', 'A', 'T');
+};
+
+
+template <typename T, int PLEX_SIZE = 16>
+class cxPlexList {
+protected:
+	struct Link {
+		Link* mpPrev;
+		Link* mpNext;
+		T* mpItem;
+
+		void init(T* pItem) {
+			mpPrev = nullptr;
+			mpNext = nullptr;
+			mpItem = pItem;
+		}
+
+		void reset() {
+			mpPrev = nullptr;
+			mpNext = nullptr;
+			mpItem = nullptr;
+		}
+	};
+
+	class Plex {
+	public:
+		cxPlexList* mpList;
+		Plex* mpPrev;
+		Plex* mpNext;
+		Link mNode[PLEX_SIZE];
+		int32_t mCount;
+		XD_BIT_ARY_DECL(uint32_t, mMask, PLEX_SIZE);
+
+	protected:
+		Plex() { reset(); }
+
+		void ctor(cxPlexList* pList) {
+			mpList = pList;
+			mpPrev = nullptr;
+			mpNext = nullptr;
+			reset();
+		}
+
+		friend class cxPlexList;
+
+	public:
+		class Itr {
+		protected:
+			Plex* mpPlex;
+			int32_t mCount;
+
+		public:
+			int32_t mIdx;
+
+			Itr(Plex* pPlex) : mpPlex(pPlex) {
+				reset();
+				mIdx = mpPlex->find_first();
+				if (mIdx >= 0) {
+					++mCount;
+				}
+			}
+
+			void reset() {
+				mCount = 0;
+				mIdx = -1;
+			}
+
+			void next() {
+				if (mCount >= mpPlex->get_count()) {
+					mIdx = -1;
+				} else {
+					mIdx = mpPlex->find_next(mIdx);
+					if (mIdx >= 0) {
+						++mCount;
+					}
+				}
+			}
+
+			bool end() const { return mIdx < 0; }
+
+			T* get_item() const {
+				T* pItm = nullptr;
+				if (mIdx >= 0) {
+					pItm = (*mpPlex)[mIdx];
+				}
+				return pItm;
+			}
+		};
+
+		void reset() {
+			::memset(mMask, 0, sizeof(mMask));
+			mCount = 0;
+		}
+
+		int get_count() const { return mCount; }
+		bool is_full() const { return get_count() >= PLEX_SIZE; }
+		T* get_top() { return reinterpret_cast<T*>(this + 1); }
+		T* get_end() { return get_top() + PLEX_SIZE; }
+
+		int get_idx(T* pItm) {
+			T* pTop = get_top();
+			if (pItm >= pTop && pItm < get_end()) {
+				return (int)(pItm - pTop);
+			}
+			return -1;
+		}
+
+		T* operator[](int i) { return &get_top()[i]; }
+
+		int find_next(int last = -1) const {
+			int idx = -1;
+			if (mCount > 0) {
+				for (int i = last + 1; i < PLEX_SIZE; ++i) {
+					if (XD_BIT_ARY_CK(uint32_t, mMask, i)) {
+						idx = i;
+						break;
+					}
+				}
+			}
+			return idx;
+		}
+
+		int find_first() const { return find_next(); }
+
+		int get_slot() {
+			int idx = -1;
+			if (!is_full()) {
+				for (int i = 0; i < PLEX_SIZE; ++i) {
+					if (!XD_BIT_ARY_CK(uint32_t, mMask, i)) {
+						idx = i;
+						break;
+					}
+				}
+			}
+			return idx;
+		}
+
+		T* alloc_item() {
+			T* pItm = nullptr;
+			int idx = get_slot();
+			if (idx >= 0) {
+				XD_BIT_ARY_ST(uint32_t, mMask, idx);
+				pItm = operator[](idx);
+				++mCount;
+			}
+			if (pItm && mpList && mpList->mItmCtor) {
+				mpList->mItmCtor(pItm);
+			}
+			return pItm;
+		}
+
+		void free_item(T* pItm) {
+			int idx = get_idx(pItm);
+			if (idx >= 0) {
+				if (pItm && mpList && mpList->mItmDtor) {
+					mpList->mItmDtor(pItm);
+				}
+				XD_BIT_ARY_CL(uint32_t, mMask, idx);
+				--mCount;
+			}
+		}
+	};
+
+	Plex* mpHead;
+	Link* mpLinkHead;
+	Link* mpLinkTail;
+	void (*mItmCtor)(T*);
+	void (*mItmDtor)(T*);
+	int32_t mCount;
+	bool mAutoDelete;
+
+	Plex* alloc_plex() {
+		Plex* pPlex = nullptr;
+		size_t size = sizeof(Plex) + PLEX_SIZE*sizeof(T);
+		void* pMem = nxCore::mem_alloc(size, XD_FOURCC('P', 'L', 'E', 'X'));
+		if (pMem) {
+			pPlex = reinterpret_cast<Plex*>(pMem);
+			pPlex->ctor(this);
+		}
+		return pPlex;
+	}
+
+	void free_plex(Plex* pPlex) {
+		if (!pPlex) return;
+		nxCore::mem_free(pPlex);
+	}
+
+	void clear_plex(Plex* pPlex) {
+		if (!pPlex) return;
+		if (pPlex->get_count()) {
+			if (mItmDtor) {
+				for (typename Plex::Itr it(pPlex); !it.end(); it.next()) {
+					mItmDtor(it.get_item());
+				}
+			}
+		}
+		pPlex->reset();
+	}
+
+	void destroy_plex(Plex* pPlex) {
+		clear_plex(pPlex);
+		free_plex(pPlex);
+	}
+
+	Plex* find_plex(T* pItem) const {
+		Plex* pRes = nullptr;
+		Plex* pPlex = mpHead;
+		while (pPlex) {
+			if (pPlex->get_idx(pItem) >= 0) {
+				pRes = pPlex;
+				break;
+			}
+			pPlex = pPlex->mpNext;
+		}
+		return pRes;
+	}
+
+public:
+	class Itr {
+	protected:
+		Link* mpLink;
+	public:
+		Itr(Link* pLink) : mpLink(pLink) {}
+		T* item() const { return mpLink ? mpLink->mpItem : nullptr; }
+		bool end() const { return mpLink == nullptr; }
+		void next() {
+			if (mpLink) {
+				mpLink = mpLink->mpNext;
+			}
+		}
+	};
+
+protected:
+	void ctor(bool preAlloc, bool autoDelete) {
+		mpHead = nullptr;
+		mpLinkHead = nullptr;
+		mpLinkTail = nullptr;
+		set_item_handlers(nullptr, nullptr);
+		mCount = 0;
+		mAutoDelete = autoDelete;
+		if (preAlloc) {
+			mpHead = alloc_plex();
+		}
+	}
+
+	void dtor() {
+		purge();
+	}
+
+public:
+	cxPlexList(bool preAlloc = false, bool autoDelete = true) {
+		ctor(preAlloc, autoDelete);
+	}
+
+	~cxPlexList() {
+		dtor();
+	}
+
+	void set_item_handlers(void (*ctor)(T*), void (*dtor)(T*)) {
+		mItmCtor = ctor;
+		mItmDtor = dtor;
+	}
+
+	int get_count() const { return mCount; }
+
+	void purge() {
+		Plex* pPlex = mpHead;
+		while (pPlex) {
+			Plex* pNext = pPlex->mpNext;
+			destroy_plex(pPlex);
+			pPlex = pNext;
+		}
+		mCount = 0;
+		mpLinkHead = nullptr;
+		mpLinkTail = nullptr;
+		mpHead = nullptr;
+	}
+
+	void clear() {
+		Plex* pPlex = mpHead;
+		while (pPlex) {
+			Plex* pNext = pPlex->mpNext;
+			clear_plex(pPlex);
+			if (mAutoDelete) {
+				free_plex(pPlex);
+			}
+			pPlex = pNext;
+		}
+		mCount = 0;
+		mpLinkHead = nullptr;
+		mpLinkTail = nullptr;
+		if (mAutoDelete) {
+			mpHead = nullptr;
+		}
+	}
+
+	T* new_item() {
+		T* pItem = 0;
+		if (!mpHead) {
+			mpHead = alloc_plex();
+			mpLinkHead = 0;
+			mpLinkHead = 0;
+			mCount = 0;
+		}
+		Plex* pPlex = mpHead;
+		while (true) {
+			if (!pPlex->is_full()) {
+				break;
+			}
+			if (pPlex->mpNext) {
+				pPlex = pPlex->mpNext;
+			} else {
+				Plex* pNew = alloc_plex();
+				pNew->mpPrev = pPlex;
+				pPlex->mpNext = pNew;
+				pPlex = pNew;
+				break;
+			}
+		}
+		if (pPlex) {
+			pItem = pPlex->alloc_item();
+			if (pItem) {
+				int idx = pPlex->get_idx(pItem);
+				if (idx >= 0) {
+					Link* pLink = &pPlex->mNode[idx];
+					pLink->init(pItem);
+					if (mpLinkHead) {
+						pLink->mpPrev = mpLinkTail;
+						mpLinkTail->mpNext = pLink;
+						mpLinkTail = pLink;
+					} else {
+						mpLinkHead = pLink;
+						mpLinkTail = pLink;
+					}
+				}
+			}
+		}
+		if (pItem) {
+			++mCount;
+		}
+		return pItem;
+	}
+
+	void remove(T* pItem) {
+		if (!pItem) return;
+		if (mCount <= 0) return;
+		Plex* pPlex = find_plex(pItem);
+		if (pPlex) {
+			int idx = pPlex->get_idx(pItem);
+			if (idx >= 0) {
+				Link* pLink = &pPlex->mNode[idx];
+				Link* pNext = pLink->mpNext;
+				if (pLink->mpPrev) {
+					pLink->mpPrev->mpNext = pNext;
+					if (pNext) {
+						pNext->mpPrev = pLink->mpPrev;
+					} else {
+						mpLinkTail = pLink->mpPrev;
+					}
+				} else {
+					mpLinkHead = pNext;
+					if (mpLinkHead) {
+						mpLinkHead->mpPrev = nullptr;
+					} else {
+						mpLinkTail = nullptr;
+					}
+				}
+				pPlex->free_item(pItem);
+				pLink->reset();
+				--mCount;
+				if (pPlex->get_count() <= 0) {
+					if (mAutoDelete) {
+						Plex* pPrevPlex = pPlex->mpPrev;
+						Plex* pNextPlex = pPlex->mpNext;
+						destroy_plex(pPlex);
+						if (pPlex == mpHead) {
+							mpHead = nullptr;
+						} else {
+							if (pPrevPlex) {
+								pPrevPlex->mpNext = pNextPlex;
+							}
+							if (pNextPlex) {
+								pNextPlex->mpPrev = pPrevPlex;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	Itr get_itr() { return Itr(mpLinkHead); }
+
+	T* get_item(int idx) {
+		T* pItm = nullptr;
+		if (uint32_t(idx) < uint32_t(get_count())) {
+			int cnt = 0;
+			for (Itr it = get_itr(); !it.end(); it.next()) {
+				if (cnt == idx) {
+					pItm = it.item();
+					break;
+				}
+				++cnt;
+			}
+		}
+		return pItm;
+	}
+
+	static cxPlexList* create(bool preAlloc = false, bool autoDelete = true) {
+		cxPlexList* pLst = (cxPlexList*)nxCore::mem_alloc(sizeof(cxPlexList), XD_FOURCC('P', 'L', 'E', 'X'));
+		if (pLst) {
+			pLst->ctor(preAlloc, autoDelete);
+		}
+		return pLst;
+	}
+
+	static void destroy(cxPlexList* pLst) {
+		if (pLst) {
+			pLst->dtor();
+			nxCore::mem_free(pLst);
+		}
+	}
+};
+
+class cxStrStore {
+private:
+	cxStrStore* mpNext;
+	size_t mSize;
+	size_t mPtr;
+
+	cxStrStore() {}
+
+public:
+	char* add(const char* pStr);
+
+	static cxStrStore* create();
+	static void destroy(cxStrStore* pStore);
+};
+
+template<typename T> class cxStrMap {
+protected:
+	struct Slot {
+		const char* pKey;
+		T val;
+		uint32_t hash;
+
+		void chain() {
+			hash |= 1U << 31;
+		}
+
+		bool is_chained() const {
+			return (hash & (1U << 31)) != 0;
+		}
+
+		uint32_t get_hash() {
+			return hash & (~(1U << 31));
+		}
+
+		bool hash_cmp(uint32_t h) {
+			return get_hash() == h;
+		}
+
+		void clear_hash() {
+			hash &= 1U << 31;
+		}
+	};
+
+	int mInUse;
+	float mLoadFactor;
+	int mThreshold;
+	int mSize;
+	Slot* mpSlots;
+
+	void set_new_tbl(Slot* pSlots) {
+		if (mpSlots) {
+			nxCore::mem_free(mpSlots);
+		}
+		mpSlots = pSlots;
+		mThreshold = nxCalc::min(int(float(mSize) * mLoadFactor), mSize - 1);
+	}
+
+	Slot* alloc_tbl(int newSize = 0) {
+		size_t size = (newSize <= 0 ? mSize : newSize) * sizeof(Slot);
+		Slot* pSlots = reinterpret_cast<Slot*>(nxCore::mem_alloc(size, XD_FOURCC('S','M','A','P')));
+		if (pSlots) {
+			::memset(pSlots, 0, size);
+		}
+		return pSlots;
+	}
+
+	uint32_t calc_step(uint32_t hash, int size = 0) {
+		uint32_t s = uint32_t(size <= 1 ? mSize : size);
+		return (((hash >> 5) + 1U) % (s-1)) + 1;
+	}
+
+	void rehash() {
+		uint32_t newSize = uint32_t(nxCalc::prime((mSize << 1) | 1));
+		Slot* pNewSlots = alloc_tbl(newSize);
+		for (int i = 0; i < mSize; ++i) {
+			if (mpSlots[i].pKey) {
+				uint32_t h = mpSlots[i].get_hash();
+				uint32_t spot = h;
+				uint32_t step = calc_step(h, newSize);
+				for (uint32_t j = spot % newSize; ; spot += step, j = spot % newSize) {
+					if (pNewSlots[j].pKey) {
+						pNewSlots[j].chain();
+					} else {
+						pNewSlots[j].pKey = mpSlots[i].pKey;
+						pNewSlots[j].val = mpSlots[i].val;
+						pNewSlots[j].hash |= h;
+						break;
+					}
+				}
+			}
+		}
+		mSize = int(newSize);
+		set_new_tbl(pNewSlots);
+	}
+
+	const char* get_removed_marker() const {
+		return reinterpret_cast<const char*>(this);
+	}
+
+	const char* put_impl(const char* pKey, T val, bool overwrite) {
+		if (mInUse >= mThreshold) {
+			rehash();
+		}
+		const char* pRemoved = get_removed_marker();
+		uint32_t h = nxCore::str_hash32(pKey) & (~(1U << 31));
+		uint32_t spot = h;
+		uint32_t step = calc_step(h);
+		int freeIdx = -1;
+		for (int i = 0; i < mSize; ++i) {
+			int idx = int(spot % uint32_t(mSize));
+			Slot* pSlot = &mpSlots[idx];
+			if (freeIdx < 0 && pSlot->pKey == pRemoved && pSlot->is_chained()) {
+				freeIdx = idx;
+			}
+			if (!pSlot->pKey || (pSlot->pKey == pRemoved && !pSlot->is_chained())) {
+				if (freeIdx < 0) {
+					freeIdx = idx;
+				}
+				break;
+			}
+			if (pSlot->hash_cmp(h) && nxCore::str_eq(pSlot->pKey, pKey)) {
+				if (overwrite) {
+					mpSlots[idx].val = val;
+					return mpSlots[idx].pKey;
+				} else {
+					return nullptr;
+				}
+			}
+			if (freeIdx < 0) {
+				mpSlots[idx].chain();
+			}
+			spot += step;
+		}
+		if (freeIdx >= 0) {
+			mpSlots[freeIdx].pKey = pKey;
+			mpSlots[freeIdx].val = val;
+			mpSlots[freeIdx].hash |= h;
+			++mInUse;
+			return mpSlots[freeIdx].pKey;
+		}
+		return nullptr;
+	}
+
+	int find(const char* pKey) {
+		uint32_t h = nxCore::str_hash32(pKey) & (~(1U << 31));
+		uint32_t spot = h;
+		uint32_t step = calc_step(h);
+		for (int i = 0; i < mSize; ++i) {
+			int idx = int(spot % uint32_t(mSize));
+			Slot* pSlot = &mpSlots[idx];
+			if (!pSlot->pKey) return -1;
+			if (pSlot->hash_cmp(h) && nxCore::str_eq(pSlot->pKey, pKey)) {
+				return idx;
+			}
+			if (!pSlot->is_chained()) {
+				return -1;
+			}
+			spot += step;
+		}
+		return -1;
+	}
+
+	void ctor(int capacity, float loadScl) {
+		mInUse = 0;
+		mpSlots = nullptr;
+		capacity = nxCalc::max(capacity, 16);
+		mLoadFactor = 0.75f * nxCalc::max(loadScl, 0.1f);
+		mSize = nxCalc::prime(int(float(capacity) / mLoadFactor));
+		set_new_tbl(alloc_tbl());
+	}
+
+	void dtor() {
+		if (mpSlots) {
+			nxCore::mem_free(mpSlots);
+		}
+	}
+
+public:
+	cxStrMap(int capacity = 0, float loadScl = 1.0f) {
+		ctor(capacity, loadScl);
+	}
+
+	~cxStrMap() {
+		dtor();
+	}
+
+	int get_item_count() const {
+		return mInUse;
+	}
+
+	const char* put(const char* pKey, T val) {
+		if (pKey == nullptr || pKey == get_removed_marker()) {
+			return nullptr;
+		}
+		return put_impl(pKey, val, true);
+	}
+
+	const char* add(const char* pKey, T val) {
+		if (pKey == nullptr || pKey == get_removed_marker()) {
+			return nullptr;
+		}
+		return put_impl(pKey, val, false);
+	}
+
+	bool get(const char* pKey, T* pVal) {
+		int idx = find(pKey);
+		if (idx < 0) return false;
+		if (pVal) {
+			*pVal = mpSlots[idx].val;
+		}
+		return true;
+	}
+
+	void remove(const char* pKey) {
+		int idx = find(pKey);
+		if (idx >= 0) {
+			mpSlots[idx].clear_hash();
+			if (mpSlots[idx].is_chained()) {
+				mpSlots[idx].pKey = get_removed_marker();
+			} else {
+				mpSlots[idx].pKey = nullptr;
+			}
+			::memset(&mpSlots[idx].val, 0, sizeof(T));
+			--mInUse;
+		}
+	}
+
+	static cxStrMap* create(int capacity = 0, float loadScl = 1.0f) {
+		cxStrMap* pMap = (cxStrMap*)nxCore::mem_alloc(sizeof(cxStrMap), XD_FOURCC('S', 'M', 'A', 'P'));
+		if (pMap) {
+			pMap->ctor(capacity, loadScl);
+		}
+		return pMap;
+	}
+
+	static void destroy(cxStrMap* pMap) {
+		if (pMap) {
+			pMap->dtor();
+			nxCore::mem_free(pMap);
+		}
+	}
+};
+
+class cxCmdLine {
+protected:
+	typedef cxStrMap<char*> MapT;
+	typedef cxPlexList<char*> ListT;
+
+	char* mpProgPath;
+	cxStrStore* mpStore;
+	ListT* mpArgLst;
+	MapT* mpOptMap;
+
+	void ctor(int argc, char* argv[]);
+	void dtor();
+
+public:
+	cxCmdLine(int argc, char* argv[]) {
+		ctor(argc, argv);
+	}
+
+	~cxCmdLine() {
+		dtor();
+	}
+
+	const char* get_full_prog_path() const {
+		return mpProgPath;
+	}
+
+	int get_num_arg() const {
+		return mpArgLst ? mpArgLst->get_count() : 0;
+	}
+
+	const char* get_arg(int i) const;
+
+	int get_num_opt() const {
+		return mpOptMap ? mpOptMap->get_item_count() : 0;
+	}
+
+	const char* get_opt(const char* pName) const;
+
+	static cxCmdLine* create(int argc, char* argv[]) {
+		cxCmdLine* pCmdLine = (cxCmdLine*)nxCore::mem_alloc(sizeof(cxCmdLine), XD_FOURCC('C', 'M', 'D', 'L'));
+		if (pCmdLine) {
+			pCmdLine->ctor(argc, argv);
+		}
+		return pCmdLine;
+	}
+
+	static void destroy(cxCmdLine* pCmdLine) {
+		if (pCmdLine) {
+			pCmdLine->dtor();
+			nxCore::mem_free(pCmdLine);
+		}
+	}
 };
 
 
